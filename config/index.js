@@ -13,5 +13,11 @@ module.exports = {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_DATABASE
+  },
+  respaldo: {
+    // Expresión cron "minuto hora día mes día-semana"; por defecto, todos los días a las 02:00.
+    horario: process.env.RESPALDO_CRON || '0 2 * * *',
+    // Zona horaria IANA (p. ej. America/Caracas); sin definir, se usa la hora local del servidor.
+    zona: process.env.RESPALDO_ZONA || undefined
   }
 };

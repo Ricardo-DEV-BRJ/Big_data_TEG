@@ -2,8 +2,8 @@
 # (minio-server); si se necesita en otra máquina: docker compose --profile minio up -d
 services:
   minio:
-    profiles: ["minio"]
-    image: minio/minio:latest
+    # profiles: ["minio"]
+    image: pgsty/silo
     container_name: minio-server
     command: server /data --console-address ":9001"
     environment:

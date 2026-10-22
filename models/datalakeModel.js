@@ -7,10 +7,20 @@
  * filtra una sentencia.
  */
 const crypto = require('crypto');
+const path = require('path');
 const { cliente, bucket } = require('../config/minio');
 
 function prefijoParticion(dataset, fecha) {
   return `parquet/${dataset}/fecha_carga=${fecha}/`;
+}
+
+function nombreParquet(origen) {
+  const base = path.basename(origen, path.extname(origen))
+    .normalize('NFD').replace(/\p{M}/gu, '').replace(/[^A-Za-z0-9_-]+/g, '_') || 'archivo';
+  const marca = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
+  // El sufijo aleatorio evita que dos archivos con el mismo nombre creados en el
+  // mismo segundo se sobrescriban en MinIO.
+  return `${base}_${marca}_${crypto.randomBytes(4).toString('hex')}.parquet`;
 }
 
 function urlS3(clave) {
@@ -36,9 +46,10 @@ async function tamanoObjeto(clave) {
   return (await cliente.statObject(bucket, clave)).size;
 }
 
-// Los CSV recibidos esperan en staging/ mientras DuckDB los convierte; luego se borran.
-function claveStaging() {
-  return `staging/${crypto.randomUUID()}.csv`;
+// Los archivos (CSV recibidos, JSON de respaldos) esperan en staging/ mientras
+// DuckDB los convierte; luego se borran.
+function claveStaging(extension = 'csv') {
+  return `staging/${crypto.randomUUID()}.${extension}`;
 }
 
 // Sube un stream sin tamaño conocido (multipart) y devuelve los bytes escritos.
@@ -61,6 +72,7 @@ function eliminarObjeto(clave) {
 
 module.exports = {
   prefijoParticion,
+  nombreParquet,
   urlS3,
   patronDataset,
   asegurarBucket,

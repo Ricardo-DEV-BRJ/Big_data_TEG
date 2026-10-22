@@ -47,6 +47,20 @@ class productosModel {
     })
   }
 
+  ventasCliente(dataset, nom = '', limite = 20) {
+    return new Promise((resolve, reject) => {
+      const sql = `
+        SELECT *
+         FROM read_parquet($ruta, union_by_name = true)
+         WHERE cliente ILIKE '%' || $nom || '%'
+         LIMIT $limite`
+
+      duckdb.consultar(sql, { ruta: datalake.patronDataset(dataset), nom, limite })
+        .then((result) => resolve(result))
+        .catch((error) => reject(error))
+    })
+  }
+
 }
 /**
  * Filas cargadas por día de un dataset.

@@ -4,8 +4,6 @@
  * escribe el Parquet directamente en el bucket: nada pasa por el disco del
  * backend ni se carga completo en la memoria de Node.
  */
-const crypto = require('crypto');
-const path = require('path');
 const duckdb = require('../config/duckdb');
 const db = require('../config/mariadb');
 const datalake = require('./datalakeModel');
@@ -13,15 +11,6 @@ const datalake = require('./datalakeModel');
 // Filas que DuckDB examina para deducir los tipos de columna. Si un valor
 // posterior no encaja, se reintenta leyendo el archivo completo.
 const MUESTRA_TIPOS = 200000;
-
-function nombreParquet(archivoOrigen) {
-  const base = path.basename(archivoOrigen, path.extname(archivoOrigen))
-    .normalize('NFD').replace(/\p{M}/gu, '').replace(/[^A-Za-z0-9_-]+/g, '_') || 'archivo';
-  const marca = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
-  // El sufijo aleatorio evita que dos CSV con el mismo nombre subidos en el
-  // mismo segundo se sobrescriban en MinIO.
-  return `${base}_${marca}_${crypto.randomBytes(4).toString('hex')}.parquet`;
-}
 
 const SEPARADORES = [',', ';', '\t', '|'];
 
@@ -90,7 +79,7 @@ function copiarAParquet(origen, destino, archivoOrigen, separador, muestra) {
  * @param {{dataset: string, fecha: string, archivoOrigen: string}} datos  ya validados
  */
 async function crear(csv, { dataset, fecha, archivoOrigen }) {
-  const clave = datalake.prefijoParticion(dataset, fecha) + nombreParquet(archivoOrigen);
+  const clave = datalake.prefijoParticion(dataset, fecha) + datalake.nombreParquet(archivoOrigen);
   const origen = datalake.urlS3(csv.clave);
   const destino = datalake.urlS3(clave);
   const inicio = Date.now();
