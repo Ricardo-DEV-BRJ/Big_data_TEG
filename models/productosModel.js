@@ -1,0 +1,67 @@
+const duckdb = require('../config/duckdb');
+const datalake = require('./datalakeModel');
+
+
+class productosModel {
+  // Con fecha solo se lee la carpeta fecha_carga=<fecha>; sin fecha, todos los días.
+  promedio(dataset, fecha) {
+    return new Promise((resolve, reject) => {
+      const sql = `WITH datos_parquet AS (
+      SELECT Price, Name
+      FROM read_parquet($ruta, hive_partitioning = true, union_by_name = true, filename = true)
+      )
+    SELECT AVG(Price) AS promedio_precio, SUM(Price) AS total, COUNT(*) AS filas,
+        (
+          SELECT list(Name)
+          FROM (
+            SELECT Name
+            FROM datos_parquet
+                GROUP BY Name
+                ORDER BY COUNT(*) DESC
+                LIMIT 3 -- Ajusta la cantidad de nombres en el array aquí
+            )
+        ) AS nombres_mas_repetidos
+      FROM datos_parquet`
+      duckdb.consultar(sql, { ruta: datalake.patronDataset(dataset, fecha) })
+        .then((result) => resolve(result))
+        .catch((error) => reject(error))
+    })
+  }
+
+  // Productos más vendidos por unidades (SUM(cantidad)), de mayor a menor.
+  // Con fecha solo se lee la carpeta de ese día; sin fecha, todos los días.
+  ventas(dataset, fecha, limite = 20) {
+    return new Promise((resolve, reject) => {
+      const sql = `
+        SELECT producto,
+               SUM(cantidad)          AS unidades_vendidas,
+               COUNT(*)               AS numero_ventas,
+         FROM read_parquet($ruta, union_by_name = true)
+         GROUP BY producto
+         ORDER BY unidades_vendidas DESC
+         LIMIT $limite`
+
+      duckdb.consultar(sql, { ruta: datalake.patronDataset(dataset, fecha), limite })
+        .then((result) => resolve(result))
+        .catch((error) => reject(error))
+    })
+  }
+
+}
+/**
+ * Filas cargadas por día de un dataset.
+ * @returns {Promise<Array<{fecha_carga: string, filas: number, archivos: number}>>}
+ */
+function filasPorDia(dataset) {
+  return duckdb.consultar(
+    `SELECT fecha_carga,
+            count(*)                 AS filas,
+            count(DISTINCT filename) AS archivos
+       FROM read_parquet($ruta, hive_partitioning = true, union_by_name = true, filename = true)
+      GROUP BY fecha_carga
+      ORDER BY fecha_carga DESC`,
+    { ruta: datalake.patronDataset(dataset) }
+  );
+}
+
+module.exports = new productosModel();
