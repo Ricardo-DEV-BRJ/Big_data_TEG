@@ -62,6 +62,17 @@ class productosController {
         });
     })
   }
+
+  productosTop() {
+    return new Promise((resolve, reject) => {
+      model.productosTop()
+        .then((res) => {
+          resolve(res)
+        }).catch((err) => {
+          reject(err)
+        });
+    })
+  }
 }
 
 module.exports = new productosController();

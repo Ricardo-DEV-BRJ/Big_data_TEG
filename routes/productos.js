@@ -36,4 +36,13 @@ router.post('/ventas-cliente', function (req, res) {
   });
 });
 
+router.get('/productos-top', function (req, res) {
+  controller.productosTop()
+  .then((result) => {
+    res.status(200).json(result)
+  }).catch((err) => {
+    res.status(estadoDeError(err)).json({ error: err.message })
+  });
+});
+
 module.exports = router;

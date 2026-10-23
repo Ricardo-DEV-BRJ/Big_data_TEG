@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "start": "node --env-file=.env ./bin/www",
-    "dev": "nodemon --exec \"node --env-file=.env\" ./bin/www",
+    "dev": "docker start minio-server && nodemon --exec \"node --env-file=.env\" ./bin/www",
     "csv-prueba": "node scripts/generar-csv-prueba.js",
     "csv": "node scripts/generar-ventas.js"
   },

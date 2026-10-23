@@ -1,6 +1,6 @@
 const duckdb = require('../config/duckdb');
 const datalake = require('./datalakeModel');
-
+const db = require('../config/mariadb')
 
 class productosModel {
   // Con fecha solo se lee la carpeta fecha_carga=<fecha>; sin fecha, todos los días.
@@ -59,6 +59,23 @@ class productosModel {
         .then((result) => resolve(result))
         .catch((error) => reject(error))
     })
+  }
+
+  // Calcula los 10 productos más vendidos en DuckDB y los guarda en MariaDB.
+  async productosTop() {
+    const sqlSer = 'INSERT INTO productos_top (nombre, cantidad) VALUES ?'
+    const sql = `
+      SELECT producto, SUM(cantidad) AS cantidad
+       FROM read_parquet($ruta, union_by_name = true)
+       GROUP BY producto
+       ORDER BY cantidad DESC
+       LIMIT 20`
+    await db.query('TRUNCATE TABLE productos_top')
+    const productos = await duckdb.consultar(sql, { ruta: datalake.patronDataset('ventas') })
+    if (productos.length === 0) return { mensaje: 'sin datos', status: 200 }
+    const filas = productos.map((p) => [p.producto, p.cantidad])
+    await db.query(sqlSer, [filas])
+    return { mensaje: 'exitoso', status: 201 }
   }
 
 }

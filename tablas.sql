@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS productos_top (
+  nombre VARCHAR(200) NOT NULL,
+  cantidad INT UNSIGNED NOT NULL
+)
