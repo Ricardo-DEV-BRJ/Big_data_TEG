@@ -1,7 +1,10 @@
 /**
- * Conexión a la base de datos de servicio (MariaDB / MySQL). Por ahora solo guarda
- * el registro de cada CSV subido (tabla ingestas), que evita cargas duplicadas.
+ * Conexión a la base de datos de servicio (MariaDB / MySQL). Guarda el registro de
+ * cada CSV subido (tabla ingestas) y las métricas ya calculadas que lee el front
+ * (tablas definidas en tablas.sql).
  */
+const fs = require('fs');
+const path = require('path');
 const mysql = require('mysql2/promise');
 const config = require('./index');
 
@@ -34,8 +37,18 @@ const ESQUEMA = [
     origen VARCHAR(16) NOT NULL DEFAULT 'api',
     creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX ingestas_dataset_fecha (dataset, fecha)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+  ...sentenciasDe(path.join(__dirname, '..', 'tablas.sql'))
 ];
+
+// Sentencias de un archivo .sql separadas por ";" (sin los comentarios "--").
+function sentenciasDe(archivo) {
+  return fs.readFileSync(archivo, 'utf8')
+    .replace(/--.*$/gm, '')
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 let listo = null;
 function iniciar() {
@@ -54,8 +67,27 @@ async function query(sql, params) {
   return filas;
 }
 
+// Ejecuta fn(conexion) dentro de una transacción: si fn falla, no se aplica nada.
+async function transaccion(fn) {
+  await iniciar();
+  const conexion = await pool.getConnection();
+  try {
+    await conexion.beginTransaction();
+    const resultado = await fn({
+      query: async (sql, params) => (await conexion.query(sql, params))[0]
+    });
+    await conexion.commit();
+    return resultado;
+  } catch (err) {
+    await conexion.rollback().catch(() => {});
+    throw err;
+  } finally {
+    conexion.release();
+  }
+}
+
 function cerrar() {
   return pool.end();
 }
 
-module.exports = { query, cerrar };
+module.exports = { query, transaccion, cerrar };

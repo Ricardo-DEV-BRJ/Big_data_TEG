@@ -3,29 +3,8 @@
  *   parquet/respaldo_<tabla>/fecha_carga=AAAA-MM-DD/
  * Para respaldar otra tabla basta con agregarla a TABLAS.
  */
-const duckdb = require('../config/duckdb');
-const datalake = require('../models/datalakeModel');
-
 const db = require('../config/mariadb');
 const parquet = require('../models/parquetModel');
-
-async function productosTop() {
-  const sqlSer = 'INSERT INTO productos_top (nombre, cantidad) VALUES ?'
-  const sql = `
-      SELECT producto, SUM(cantidad) AS cantidad
-       FROM read_parquet($ruta, union_by_name = true)
-       GROUP BY producto
-       ORDER BY cantidad DESC
-       LIMIT 20`
-  await db.query('TRUNCATE TABLE productos_top')
-  const productos = await duckdb.consultar(sql, { ruta: datalake.patronDataset('ventas') })
-  if (productos.length === 0) return { mensaje: 'sin datos', status: 200 }
-  const filas = productos.map((p) => [p.producto, p.cantidad])
-  await db.query(sqlSer, [filas])
-  return { mensaje: 'exitoso', status: 201 }
-}
-
-
 
 // Tablas que se respaldan y columnas (encabezado) que se copian de cada una.
 const TABLAS = [
@@ -52,8 +31,6 @@ async function respaldo() {
       console.log(r.clave
         ? `[respaldo] ${t.tabla}: ${r.filas} filas -> ${r.clave} (${r.bytes} bytes)`
         : `[respaldo] ${t.tabla}: sin registros, no se generó archivo`);
-      const metricas = await productosTop()
-      console.log(`[Metricas] ${metricas.mensaje} ${metricas.status}`)
     } catch (err) {
       console.error(`[respaldo] ${t.tabla} falló:`, err.message);
     }
