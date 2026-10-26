@@ -435,6 +435,24 @@ valores van como parámetros y `orden` solo acepta valores de una lista.
 | `GET /api/productos/productos-top` | Recalcula solo `productos_top` |
 | `GET /api/tareas` | Contenido de los respaldos de `ingestas` |
 
+### Autenticación y roles
+
+Las rutas privadas requieren `Authorization: Bearer <token>`. La única ruta pública es
+`POST /api/auth/login`; las cuentas creadas por administración quedan con
+`must_change_password = true` y solo pueden usar `POST /api/auth/change-password` hasta
+definir una contraseña nueva. Luego pueden acceder a las rutas permitidas por su rol.
+
+| Rol | Vistas y permisos |
+|---|---|
+| `vendedor` | Ventas, productos y clientes |
+| `gerente` | Reportes y módulos de gestión: resumen, ventas, productos, clientes, cobranza, equipo comercial, pagos, inventario, proveedores y calidad |
+| `administrador` | Todo el sistema, incluida la gestión de usuarios y el recálculo de métricas |
+
+La gestión de usuarios (`GET/POST /api/auth/usuarios` y `DELETE /api/auth/usuarios/:id`)
+es exclusiva de administradores. Para crear una cuenta, enviar `email`, `password` (mínimo
+8 caracteres, contraseña temporal) y `rol`. El panel está disponible en `/panel/usuarios`.
+Configura `JWT_SECRET` con un valor aleatorio y privado en el entorno del servidor.
+
 ---
 
 ## 9. Tareas programadas (`tareas/`)
@@ -457,9 +475,9 @@ Vue 3 + Vite + Vuetify 4 + Chart.js, en TypeScript.
 
 | Archivo | Qué hace |
 |---|---|
-| `src/config/api.ts` | `apiCall(endpoint, data, method)`: axios contra `VITE_API_URL`, con cookies y token `Bearer` si existe la cookie `token` |
-| `src/router/index.ts` | Rutas `/` (inicio) y `/Dashboard` |
-| `src/pages/Dashboard.vue` | Dashboard de ventas: KPI, gráfico de barras y ranking del top de productos (`GET /api/metricas`) |
+| `src/config/api.ts` | `apiCall(endpoint, data, method)`: axios contra `VITE_API_URL`, autenticado con token Bearer |
+| `src/router/index.ts` | Login, cambio de contraseña obligatorio, rutas de panel y control de acceso por rol |
+| `src/modulos/usuarios/UsuariosModulo.vue` | Alta, listado y desactivación de usuarios (solo administrador) |
 | `src/components/BotonTema.vue` | Cambia entre tema claro y oscuro |
 | `src/theme/temaJM.ts`, `src/plugins/vuetify.ts` | Temas `light_JM` y `dark_JM` |
 

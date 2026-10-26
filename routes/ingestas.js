@@ -2,8 +2,10 @@ const express = require('express');
 const subidaCsv = require('../middlewares/subidaCsv');
 const ingestaController = require('../controllers/ingestaController');
 const { estadoDeError } = require('../utils/http');
+const { verToken, noCambioForzado, soloRoles } = require('../middlewares/auth');
 
 const router = express.Router();
+router.use(verToken, noCambioForzado, soloRoles('administrador'));
 
 /**
  * POST /api/ingestas  (multipart/form-data)

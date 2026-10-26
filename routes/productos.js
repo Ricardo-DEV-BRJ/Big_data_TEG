@@ -1,8 +1,10 @@
 const express = require('express');
 const { estadoDeError } = require('../utils/http');
 const controller = require('../controllers/productosController')
+const { verToken, noCambioForzado, soloRoles } = require('../middlewares/auth');
 
 const router = express.Router();
+router.use(verToken, noCambioForzado, soloRoles('vendedor', 'gerente', 'administrador'));
 
 /**
  * POST /api/productos  (JSON)
