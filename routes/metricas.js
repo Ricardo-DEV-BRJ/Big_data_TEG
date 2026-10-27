@@ -35,7 +35,7 @@ router.get('/estado', gerente, (req, res) => responder(res, controller.estado())
 router.get('/opciones', vendedor, (req, res) => responder(res, controller.opciones()));
 
 // Ventas e ingresos
-router.get('/resumen', gerente, (req, res) => responder(res, controller.resumen(req.query)));
+router.get('/resumen', vendedor, (req, res) => responder(res, controller.resumen(req.query)));
 router.get('/ventas/diarias', vendedor, (req, res) => responder(res, controller.ventasDiarias(req.query)));
 router.get('/ventas/semanales', vendedor, (req, res) => responder(res, controller.ventasSemanales(req.query)));
 router.get('/ventas/mensuales', vendedor, (req, res) => responder(res, controller.ventasMensuales(req.query)));
