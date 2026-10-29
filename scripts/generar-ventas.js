@@ -1,19 +1,23 @@
 /**
- * Genera los reportes sintéticos del negocio para probar el pipeline y las métricas.
- * Simula día por día un período completo (ventas, inventario por sucursal, compras a
- * proveedores) y escribe cuatro CSV listos para subir con POST /api/ingestas:
+ * Genera los reportes sintéticos de la agrocomercializadora (sede única en Trujillo)
+ * para probar el pipeline y las métricas. Simula día por día un período completo
+ * (ventas, inventario, compras a proveedores) y escribe cuatro CSV listos para subir
+ * con POST /api/ingestas:
  *
  *   ventas.csv      una fila por venta (dataset "ventas")
- *   inventario.csv  existencia diaria por sucursal y producto (dataset "inventario")
+ *   inventario.csv  existencia diaria por producto, con zona de almacén, perecedero y vida útil (dataset "inventario")
  *   compras.csv     órdenes de compra a proveedores (dataset "compras")
  *   metas.csv       meta mensual de ventas netas por vendedor (dataset "metas")
+ *   tasas.csv       tasas diarias en Bs por USD (BCV), USDT (mercado P2P) y EUR (BCV) (dataset "tasas")
  *
  * Los datos no son uniformes: pocos productos y clientes concentran la mayoría de
- * las ventas (Pareto), hay picos en quincenas, sábados y diciembre, las empresas y
- * el gobierno compran a crédito y pagan más tarde, y si no hay existencia la venta
- * se pierde. Con la misma semilla se generan siempre los mismos datos.
+ * las ventas (Pareto); la demanda de cada categoría sigue el calendario agrícola
+ * (siembra, fertilización, cosecha); los comercios y parte de los productores compran
+ * a crédito; si no hay existencia la venta se pierde, y una pequeña fracción de las
+ * ventas se registra dos veces (posibles duplicados que debe detectar el pipeline).
+ * Con la misma semilla se generan siempre los mismos datos.
  *
- * Uso: node scripts/generar-ventas.js [carpeta=tmp/datos] [filas=1000000] [desde=2025-10-01] [hasta=2026-09-30] [semilla=2026]
+ * Uso: node scripts/generar-ventas.js [carpeta=tmp/datos] [filas=60000] [desde=2025-10-01] [hasta=2026-09-30] [semilla=2026]
  */
 var fs = require('fs');
 var path = require('path');
@@ -22,7 +26,7 @@ var productos = require('../data_list/productos.js');
 var negocio = require('../data_list/negocio.js');
 
 var carpeta = process.argv[2] || 'tmp/datos';
-var total = parseInt(process.argv[3] || '1000000', 10);
+var total = parseInt(process.argv[3] || '60000', 10);
 var desde = process.argv[4] || '2025-10-01';
 var hasta = process.argv[5] || '2026-09-30';
 var semilla = parseInt(process.argv[6] || '2026', 10);
@@ -112,9 +116,9 @@ var primerDia = aDia(desde);
 var ultimoDia = aDia(hasta);
 if (!(ultimoDia >= primerDia)) throw new Error('Rango de fechas inválido: ' + desde + ' a ' + hasta);
 
-var FACTOR_SEMANA = [0.6, 0.9, 0.9, 0.95, 1.0, 1.2, 1.4];   // domingo..sábado
-var FACTOR_MES = [0.8, 0.85, 0.95, 0.95, 1.0, 0.95, 1.0, 1.05, 1.0, 1.05, 1.2, 1.6];   // enero..diciembre
-var PESO_HORA = sorteo([[8, 3], [9, 5], [10, 8], [11, 10], [12, 10], [13, 7], [14, 6], [15, 6], [16, 7], [17, 9], [18, 8], [19, 4]]);
+var FACTOR_SEMANA = [0.3, 1.1, 1.0, 1.0, 1.0, 1.1, 1.3];   // domingo..sábado
+var FACTOR_MES = negocio.ESTACION_BASE;   // enero..diciembre
+var PESO_HORA = sorteo([[7, 6], [8, 10], [9, 10], [10, 9], [11, 8], [12, 5], [13, 4], [14, 5], [15, 6], [16, 5], [17, 3]]);
 
 var calendario = [];
 var tasa = 180;
@@ -122,7 +126,7 @@ for (var d = primerDia; d <= ultimoDia; d++) {
   var f = new Date(d * DIA_MS);
   var diaMes = f.getUTCDate();
   var finDeMes = new Date(Date.UTC(f.getUTCFullYear(), f.getUTCMonth() + 1, 0)).getUTCDate();
-  var quincena = diaMes === 1 || diaMes === 15 || diaMes === 16 || diaMes === 30 || diaMes === finDeMes ? 1.35 : 1;
+  var quincena = diaMes === 1 || diaMes === 15 || diaMes === 16 || diaMes === 30 || diaMes === finDeMes ? 1.15 : 1;
   var meses = (f.getUTCFullYear() - new Date(primerDia * DIA_MS).getUTCFullYear()) * 12 +
     f.getUTCMonth() - new Date(primerDia * DIA_MS).getUTCMonth();
   // Devaluación diaria de ~0,12 % con ruido.
@@ -132,7 +136,8 @@ for (var d = primerDia; d <= ultimoDia; d++) {
     fecha: textoFecha(d),
     mes: textoFecha(d).slice(0, 7) + '-01',
     meses: meses,
-    diciembre: f.getUTCMonth() === 11,
+    mesIndice: f.getUTCMonth(),
+    temporada: FACTOR_MES[f.getUTCMonth()] >= 1.1,
     peso: FACTOR_SEMANA[f.getUTCDay()] * quincena * FACTOR_MES[f.getUTCMonth()] * (1 + 0.015 * meses),
     tasa: r2(tasa)
   });
@@ -204,9 +209,22 @@ productos.reduce(function (suma, p, i) {
   return suma;
 }, 0);
 
+// Sorteo de producto ajustado por temporada: se acepta con probabilidad proporcional
+// al factor de su categoría en el mes (muestreo por rechazo, máx. 8 intentos).
+var MAX_ESTACION = 2.0;
+function elegirProducto(mesIndice) {
+  var p = 0;
+  for (var intento = 0; intento < 8; intento++) {
+    p = buscar(acumuladoProductos, productos.length, azar());
+    var factores = negocio.estacionalidad[productos[p].categoria];
+    if (!factores || azar() * MAX_ESTACION < factores[mesIndice]) return p;
+  }
+  return p;
+}
+
 function cantidadPara(tipo, r) {
-  if (tipo === 'J' || tipo === 'G') return Math.min(60, 1 + Math.floor(-Math.log(1 - r) * 6));
-  return Math.min(10, 1 + Math.floor(-Math.log(1 - r) * 0.8));
+  if (tipo === 'J' || tipo === 'G') return Math.min(40, 1 + Math.floor(-Math.log(1 - r) * 5));
+  return Math.min(10, 1 + Math.floor(-Math.log(1 - r) * 1.2));
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +255,9 @@ var compras = [];
 function ordenar(dia, s, p) {
   var prod = productos[p];
   var prov = negocio.proveedores[prod.proveedor];
-  var cantidad = Math.max(5, Math.ceil(demanda[s][p] * 35));
+  // Los perecederos se piden para pocos días (no más de su vida útil).
+  var cobertura = Math.min(35, prod.vida_util_dias || 35);
+  var cantidad = Math.max(5, Math.ceil(demanda[s][p] * cobertura));
   var esperada = dia + prov.entrega + entre(-1, 2);
   var recepcion = esperada + (azar() < prov.probRetraso ? entre(2, 12) : 0);
   var meses = calendario[dia - primerDia].meses;
@@ -266,18 +286,25 @@ var COLUMNAS_VENTAS = ['id', 'fecha', 'fecha_hora', 'cliente', 'identificacion',
   'base_imponible', 'iva', 'total', 'moneda', 'tasa_cambio', 'metodo_pago', 'comision_bancaria', 'vendedor',
   'sucursal', 'ciudad', 'estado_geo', 'condicion_pago', 'fecha_vencimiento', 'estado', 'monto_pagado',
   'fecha_pago', 'tasa_cambio_pago'];
-var COLUMNAS_INVENTARIO = ['fecha', 'sucursal', 'sku', 'producto', 'categoria', 'stock_inicial', 'entradas',
-  'salidas', 'devoluciones', 'stock_final', 'costo_unitario', 'valor_inventario'];
+var COLUMNAS_INVENTARIO = ['fecha', 'sucursal', 'zona_almacen', 'sku', 'producto', 'categoria', 'perecedero',
+  'vida_util_dias', 'stock_inicial', 'entradas', 'salidas', 'devoluciones', 'stock_final', 'costo_unitario',
+  'valor_inventario'];
 var COLUMNAS_COMPRAS = ['nro_orden', 'fecha_orden', 'fecha_esperada', 'fecha_recepcion', 'proveedor', 'sucursal',
   'sku', 'producto', 'cantidad', 'costo_unitario', 'total'];
 var COLUMNAS_METAS = ['mes', 'sucursal', 'vendedor', 'meta_ventas'];
 
 var DESCUENTO_PROMO = sorteo([[5, 4], [10, 3], [15, 2], [20, 1]]);
-var PROB_DEVOLUCION = { 'Computación': 0.04, 'Foto y video': 0.035 };
+var PROB_DEVOLUCION = { 'Rubros perecederos': 0.04, 'Veterinarios': 0.03, 'Semillas': 0.025 };
+// Fracción de ventas que se registra dos veces en el sistema administrativo (minutos después, otro id).
+var PROB_DUPLICADO = 0.004;
+
+function sumarMinutos(fechaHora, minutos) {
+  return new Date(Date.parse(fechaHora.replace(' ', 'T') + 'Z') + minutos * 60000).toISOString().slice(0, 19).replace('T', ' ');
+}
 
 function venderUna(c, dia, id) {
   var s = azar() < 0.85 ? c.sucursal : sorteoSucursal();
-  var p = buscar(acumuladoProductos, productos.length, azar());
+  var p = elegirProducto(dia.mesIndice);
   var cantidad = cantidadPara(c.tipo, azar());
   // Sin existencia suficiente la venta se pierde (no queda registro).
   if (existencia[s][p] < cantidad) return null;
@@ -287,7 +314,7 @@ function venderUna(c, dia, id) {
   var mayorista = c.tipo === 'J' || c.tipo === 'G';
   var descuentoPct = 0;
   if (mayorista && cantidad >= 10 && azar() < 0.6) descuentoPct = cantidad >= 25 ? 15 : 10;
-  else if (azar() < (dia.diciembre ? 0.25 : 0.1)) descuentoPct = DESCUENTO_PROMO();
+  else if (azar() < (dia.temporada ? 0.15 : 0.08)) descuentoPct = DESCUENTO_PROMO();
 
   var bruto = prod.price * cantidad;
   var descuento = r2(bruto * descuentoPct / 100);
@@ -366,6 +393,7 @@ async function generar() {
   var inventario = crearSalida('inventario.csv', COLUMNAS_INVENTARIO);
   var id = 0;
   var perdidas = 0;
+  var duplicadas = 0;
   var registrados = 0;
 
   for (var i = 0; i < calendario.length; i++) {
@@ -390,6 +418,15 @@ async function generar() {
       id++;
       var espera = ventas.escribir(fila);
       if (espera) await espera;
+      if (fila[29] !== 'Anulado' && azar() < PROB_DUPLICADO) {
+        id++;
+        duplicadas++;
+        var copia = fila.slice();
+        copia[0] = id;
+        copia[2] = sumarMinutos(fila[2], entre(1, 8));
+        var esperaD = ventas.escribir(copia);
+        if (esperaD) await esperaD;
+      }
     }
 
     for (var s = 0; s < sucursales.length; s++) {
@@ -397,7 +434,8 @@ async function generar() {
         var prod = productos[p];
         var costo = r2(prod.cost * (1 + 0.004 * dia.meses));
         var esperaInv = inventario.escribir([
-          dia.fecha, sucursales[s].sucursal, prod.sku, prod.name, prod.categoria, inicial[s][p], entradas[s][p],
+          dia.fecha, sucursales[s].sucursal, prod.zona_almacen, prod.sku, prod.name, prod.categoria,
+          prod.perecedero ? 'true' : 'false', prod.vida_util_dias, inicial[s][p], entradas[s][p],
           salidas[s][p], devoluciones[s][p], existencia[s][p], costo, r2(existencia[s][p] * costo)
         ]);
         if (esperaInv) await esperaInv;
@@ -431,9 +469,24 @@ async function generar() {
   }
   await metas.cerrar();
 
+  // Tasas del día (09:00): la BCV es la misma de las ventas; el USDT cotiza con una brecha
+  // que oscila entre 5 % y 30 %, y el euro sigue un EUR/USD cercano a 1,08.
+  var COLUMNAS_TASAS = ['fecha', 'hora', 'tasa_bcv', 'tasa_usdt', 'tasa_eur', 'fuente'];
+  var tasas = crearSalida('tasas.csv', COLUMNAS_TASAS);
+  var brecha = 0.12;
+  var eurUsd = 1.08;
+  for (var t = 0; t < calendario.length; t++) {
+    brecha = Math.min(0.3, Math.max(0.05, brecha + (azar() - 0.5) * 0.02));
+    eurUsd = Math.min(1.15, Math.max(1.02, eurUsd + (azar() - 0.5) * 0.006));
+    var bcv = calendario[t].tasa;
+    var esperaT = tasas.escribir([calendario[t].fecha, '09:00', bcv, r2(bcv * (1 + brecha)), r2(bcv * eurUsd), 'BCV / P2P']);
+    if (esperaT) await esperaT;
+  }
+  await tasas.cerrar();
+
   console.log('Generado en ' + carpeta + ': ventas.csv ' + ventas.filas + ' filas (' + perdidas +
-    ' ventas perdidas por falta de existencia), inventario.csv ' + inventario.filas + ', compras.csv ' +
-    salidaCompras.filas + ', metas.csv ' + metas.filas);
+    ' ventas perdidas por falta de existencia, ' + duplicadas + ' registradas dos veces), inventario.csv ' + inventario.filas + ', compras.csv ' +
+    salidaCompras.filas + ', metas.csv ' + metas.filas + ', tasas.csv ' + tasas.filas);
 }
 
 generar().catch(function (err) {

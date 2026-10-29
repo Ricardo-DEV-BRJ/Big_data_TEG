@@ -333,6 +333,225 @@ CREATE TABLE IF NOT EXISTS proveedores_metricas (
   margen_pct DECIMAL(7,2)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Reposición por producto: clasificación por rotación A/M/B (fórmula 3), inventario de
+-- seguridad (fórmula 1) y punto de reorden (fórmula 2). Distinta del ABC por ingreso
+-- (Pareto 80/15/5) de productos_metricas.
+CREATE TABLE IF NOT EXISTS inventario_reposicion (
+  sucursal VARCHAR(100) NOT NULL,
+  sku VARCHAR(20) NOT NULL,
+  producto VARCHAR(200) NOT NULL,
+  categoria VARCHAR(100),
+  zona_almacen VARCHAR(100),
+  perecedero TINYINT(1),
+  vida_util_dias INT,
+  stock_actual INT NOT NULL,
+  stock_promedio DECIMAL(14,2) NOT NULL,
+  unidades_vendidas INT NOT NULL,
+  indice_rotacion DECIMAL(10,2),          -- unidades vendidas / inventario promedio
+  clase_rotacion CHAR(1) NOT NULL,        -- A alta, M media, B baja (terciles)
+  demanda_diaria DECIMAL(12,3),
+  desviacion_demanda DECIMAL(12,3),
+  lead_time_dias DECIMAL(8,1),            -- días promedio entre orden y recepción
+  stock_seguridad INT,
+  punto_reorden INT,
+  estado_stock VARCHAR(30) NOT NULL,      -- Agotado, Bajo stock mínimo, Reordenar, Normal
+  PRIMARY KEY (sucursal, sku)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Ventas marcadas como posible duplicado (otro id, mismo cliente, producto, cantidad y
+-- total, pocos minutos después). Se informan para revisión; no se excluyen de las métricas.
+CREATE TABLE IF NOT EXISTS ventas_posibles_duplicados (
+  id BIGINT NOT NULL PRIMARY KEY,
+  fecha DATE NOT NULL,
+  fecha_hora DATETIME,
+  cliente VARCHAR(200),
+  identificacion VARCHAR(30),
+  sku VARCHAR(20) NOT NULL,
+  producto VARCHAR(200),
+  cantidad INT NOT NULL,
+  total DECIMAL(14,2),
+  vendedor VARCHAR(150),
+  sucursal VARCHAR(100)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Previsión de la demanda por producto y mes (unidades). La fila del mes siguiente al
+-- último mes completo tiene unidades_reales NULL: es el pronóstico.
+CREATE TABLE IF NOT EXISTS prevision_demanda (
+  mes DATE NOT NULL,
+  sku VARCHAR(20) NOT NULL,
+  producto VARCHAR(200),
+  categoria VARCHAR(100),
+  unidades_reales DECIMAL(14,2),
+  promedio_movil DECIMAL(14,2),           -- promedio de los 3 meses anteriores
+  suavizamiento DECIMAL(14,2),            -- suavizamiento exponencial simple
+  PRIMARY KEY (mes, sku)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Error de cada modelo de previsión por producto (MAPE %) y pronóstico del mes siguiente.
+CREATE TABLE IF NOT EXISTS prevision_metricas (
+  sku VARCHAR(20) NOT NULL PRIMARY KEY,
+  producto VARCHAR(200),
+  categoria VARCHAR(100),
+  meses INT NOT NULL,
+  unidades_ultimo_mes DECIMAL(14,2),
+  mape_promedio_movil DECIMAL(10,2),
+  mape_suavizamiento DECIMAL(10,2),
+  modelo_recomendado VARCHAR(40),
+  mes_siguiente DATE NOT NULL,
+  prevision_siguiente DECIMAL(14,2)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Productos con ventas de margen negativo (base imponible menor que el costo).
+CREATE TABLE IF NOT EXISTS alertas_margen (
+  sku VARCHAR(20) NOT NULL PRIMARY KEY,
+  producto VARCHAR(200),
+  categoria VARCHAR(100),
+  ventas INT NOT NULL,
+  unidades INT NOT NULL,
+  venta_neta DECIMAL(16,2) NOT NULL,
+  margen DECIMAL(16,2) NOT NULL,          -- negativo: pérdida
+  ultima_fecha DATE,
+  precio_actual DECIMAL(12,2),
+  costo_actual DECIMAL(12,2),
+  descuento_maximo DECIMAL(7,2)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Tasas registradas a mano por Administración (no las borra el recálculo). Junto con
+-- dim_tasa (reporte de tasas del data lake) dan la tasa vigente y la alerta de tasa vencida.
+CREATE TABLE IF NOT EXISTS tasas_registro (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  fecha DATE NOT NULL,
+  hora TIME NOT NULL,                     -- hora local del negocio
+  tasa_bcv DECIMAL(16,4) NOT NULL,        -- Bs por USD
+  tasa_usdt DECIMAL(16,4),                -- Bs por USDT
+  tasa_eur DECIMAL(16,4),                 -- Bs por EUR
+  fuente VARCHAR(100) NOT NULL,
+  registrado_por INT UNSIGNED,
+  registrado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX tasas_registro_fecha (fecha, hora)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ===== Modelo dimensional (Figura 17) ===================================================
+-- Esquema en estrella con claves lógicas (sin FOREIGN KEY porque el recálculo reemplaza
+-- todas las tablas en una transacción): hechos_ventas -> dim_tiempo (fecha), dim_producto
+-- (sku), dim_cliente (identificacion), dim_tasa (fecha), dim_zona (zona_almacen).
+
+CREATE TABLE IF NOT EXISTS dim_tiempo (
+  fecha DATE NOT NULL PRIMARY KEY,
+  anio SMALLINT NOT NULL,
+  trimestre TINYINT NOT NULL,
+  mes TINYINT NOT NULL,
+  primer_dia_mes DATE NOT NULL,
+  dia TINYINT NOT NULL,
+  dia_semana TINYINT NOT NULL,            -- 1 lunes .. 7 domingo
+  fin_de_semana TINYINT(1) NOT NULL,
+  temporada_agricola VARCHAR(50) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS dim_producto (
+  sku VARCHAR(20) NOT NULL PRIMARY KEY,
+  producto VARCHAR(200),
+  categoria VARCHAR(100),
+  marca VARCHAR(100),
+  proveedor VARCHAR(150),
+  zona_almacen VARCHAR(100),
+  perecedero TINYINT(1),
+  vida_util_dias INT,
+  precio DECIMAL(12,2),
+  costo_unitario DECIMAL(12,2)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS dim_cliente (
+  identificacion VARCHAR(30) NOT NULL PRIMARY KEY,
+  cliente VARCHAR(200),
+  tipo_cliente VARCHAR(30),               -- Productor o Comercio
+  fecha_alta DATE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS dim_tasa (
+  fecha DATE NOT NULL PRIMARY KEY,
+  hora VARCHAR(8),
+  tasa_bcv DECIMAL(16,4),
+  tasa_usdt DECIMAL(16,4),
+  tasa_eur DECIMAL(16,4),
+  fuente VARCHAR(100)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS dim_zona (
+  zona_almacen VARCHAR(100) NOT NULL PRIMARY KEY,
+  tipo VARCHAR(50) NOT NULL,
+  productos INT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hechos_ventas (
+  id BIGINT NOT NULL PRIMARY KEY,
+  fecha DATE NOT NULL,
+  sku VARCHAR(20) NOT NULL,
+  identificacion VARCHAR(30),
+  zona_almacen VARCHAR(100),
+  vendedor VARCHAR(150),
+  metodo_pago VARCHAR(60),
+  moneda VARCHAR(10),
+  condicion_pago VARCHAR(20),
+  estado VARCHAR(20),
+  valida TINYINT(1) NOT NULL,
+  cantidad INT NOT NULL,
+  precio DECIMAL(12,2),
+  descuento DECIMAL(14,2),
+  base_imponible DECIMAL(14,2),
+  iva DECIMAL(14,2),
+  total DECIMAL(14,2),
+  costo DECIMAL(14,2),
+  margen DECIMAL(14,2),
+  tasa_cambio DECIMAL(16,4),
+  INDEX hechos_ventas_fecha (fecha),
+  INDEX hechos_ventas_sku (sku),
+  INDEX hechos_ventas_cliente (identificacion)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hechos_inventario (
+  fecha DATE NOT NULL,
+  sku VARCHAR(20) NOT NULL,
+  zona_almacen VARCHAR(100),
+  stock_inicial INT,
+  entradas INT,
+  salidas INT,
+  devoluciones INT,
+  stock_final INT,
+  costo_unitario DECIMAL(12,2),
+  valor_inventario DECIMAL(16,2),
+  PRIMARY KEY (fecha, sku)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Hechos de ambiente y energía (sensores ESP32 por MQTT). Fase futura: la tabla existe
+-- para completar el modelo, pero el prototipo no la llena.
+CREATE TABLE IF NOT EXISTS hechos_ambiente_energia (
+  fecha_hora DATETIME NOT NULL,
+  zona_almacen VARCHAR(100) NOT NULL,
+  temperatura_c DECIMAL(5,2),
+  humedad_pct DECIMAL(5,2),
+  consumo_kwh DECIMAL(10,3),
+  PRIMARY KEY (fecha_hora, zona_almacen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Bitácora de auditoría: la llena la API en cada acción relevante (no el recálculo).
+CREATE TABLE IF NOT EXISTS auditoria (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  fecha TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  usuario_id INT UNSIGNED,
+  email VARCHAR(255),
+  rol VARCHAR(30),
+  accion VARCHAR(60) NOT NULL,            -- login, login_fallido, usuario_creado, ingesta, recalculo, tasa_registrada...
+  entidad VARCHAR(60),
+  entidad_id VARCHAR(100),
+  valor_anterior LONGTEXT,                -- JSON
+  valor_nuevo LONGTEXT,                   -- JSON
+  ip VARCHAR(64),
+  resultado VARCHAR(10) NOT NULL DEFAULT 'ok',
+  INDEX auditoria_fecha (fecha),
+  INDEX auditoria_accion (accion)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Reglas de calidad de datos aplicadas a cada dataset.
 CREATE TABLE IF NOT EXISTS calidad_datos (
   dataset VARCHAR(50) NOT NULL,

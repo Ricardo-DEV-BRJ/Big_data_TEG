@@ -3,12 +3,13 @@
 -- Ejecutar sobre la base de datos `servicio`
 -- ============================================================
 
--- Tabla de usuarios del sistema
+-- Tabla de usuarios del sistema. Roles de la Tabla 18: gerente (Gerencia), administracion
+-- (Administración), vendedor (Ventas), almacen (Almacén), administrador (Soporte TI).
 CREATE TABLE IF NOT EXISTS usuarios (
   id               INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   email            VARCHAR(255) NOT NULL UNIQUE,
   password_hash    VARCHAR(255) NOT NULL,
-  rol              ENUM('vendedor', 'gerente', 'administrador') NOT NULL DEFAULT 'vendedor',
+  rol              ENUM('gerente', 'administracion', 'vendedor', 'almacen', 'administrador') NOT NULL DEFAULT 'vendedor',
   must_change_password TINYINT(1) NOT NULL DEFAULT 1,
   activo           TINYINT(1) NOT NULL DEFAULT 1,
   creado_por       INT UNSIGNED NULL,        -- FK al administrador que lo creó

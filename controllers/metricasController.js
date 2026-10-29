@@ -3,7 +3,15 @@ const v = require('../utils/validaciones')
 const model = require('../models/metricasModel')
 
 // Filtros de texto que se comparan por igualdad (ver IGUALDAD en metricasModel).
-const TEXTOS = ['sucursal', 'tipo', 'categoria', 'marca', 'segmento', 'proveedor', 'buscar']
+const TEXTOS = ['sucursal', 'tipo', 'categoria', 'marca', 'segmento', 'proveedor', 'buscar', 'sku']
+const CLASES_ROTACION = ['A', 'M', 'B']
+const ESTADOS_STOCK = ['Agotado', 'Bajo stock mínimo', 'Reordenar', 'Normal']
+
+function conLista(f, query, campo, permitidos) {
+  if (!query[campo]) return f
+  if (!permitidos.includes(query[campo])) throw createError(400, `Valor inválido para "${campo}". Valores permitidos: ${permitidos.join(', ')}`)
+  return { ...f, [campo]: query[campo] }
+}
 
 /**
  * Valida los parámetros de la consulta (req.query) y devuelve los filtros que entiende el modelo.
@@ -120,6 +128,15 @@ class metricasController {
   inventarioResumen(q) { return ejecutar(() => model.inventarioResumen(filtros(q))) }
   inventarioMensual(q) { return ejecutar(() => model.inventarioMensual(filtros(q))) }
   proveedores() { return ejecutar(() => model.proveedores()) }
+  inventarioReposicion(q = {}) {
+    return ejecutar(() => model.inventarioReposicion(
+      conLista(conLista(filtros(q), q, 'clase', CLASES_ROTACION), q, 'estado', ESTADOS_STOCK)))
+  }
+
+  // Previsión, duplicados y tablero ejecutivo
+  prevision(q) { return ejecutar(() => model.prevision(filtros(q))) }
+  duplicados(q) { return ejecutar(() => model.duplicados(filtros(q))) }
+  ejecutivo(q) { return ejecutar(() => model.ejecutivo(filtros(q))) }
 
   calidad() { return ejecutar(() => model.calidad()) }
 

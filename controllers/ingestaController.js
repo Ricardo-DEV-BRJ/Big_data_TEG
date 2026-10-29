@@ -41,4 +41,4 @@ function crear(datos, archivos) {
   });
 }
 
-module.exports = { crear };
+module.exports = { crear, descartar: descartarSubidos };

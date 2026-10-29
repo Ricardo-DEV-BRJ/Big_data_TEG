@@ -12,6 +12,8 @@ const bcrypt = require('bcryptjs');
 const jwt    = require('jsonwebtoken');
 const Usuario = require('../models/usuarioModel');
 const JWT_SECRET = require('../config/jwt');
+const { LISTA: ROLES } = require('../config/roles');
+const auditoria = require('../models/auditoriaModel');
 
 const SALT_ROUNDS = 12;
 const JWT_EXPIRES = '8h';
@@ -29,16 +31,16 @@ async function login(req, res, next) {
 
 
     const usuario = await Usuario.porEmail(email.trim().toLowerCase());
-    if (!usuario) {
+    const coincide = usuario ? await bcrypt.compare(password, usuario.password_hash) : false;
+    if (!coincide) {
+      await auditoria.registrar(req, { accion: 'login_fallido', entidad: 'usuario', email: email.trim().toLowerCase().slice(0, 255), resultado: 'error' });
       // Mismo mensaje para no revelar si el email existe.
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
-
-    const coincide = await bcrypt.compare(password, usuario.password_hash);
-    
-    if (!coincide) {
-      return res.status(401).json({ error: 'Credenciales inválidas' });
-    }
+    await auditoria.registrar(
+      { ip: req.ip, usuario: { id: usuario.id, email: usuario.email, rol: usuario.rol } },
+      { accion: 'login', entidad: 'usuario', entidad_id: usuario.id }
+    );
 
     const payload = {
       id:    usuario.id,
@@ -79,9 +81,8 @@ async function registrar(req, res, next) {
       return res.status(400).json({ error: 'La contraseña temporal debe tener al menos 8 caracteres' });
     }
 
-    const rolesValidos = ['vendedor', 'gerente', 'administrador'];
-    if (!rolesValidos.includes(rol)) {
-      return res.status(400).json({ error: `Rol inválido. Valores permitidos: ${rolesValidos.join(', ')}` });
+    if (!ROLES.includes(rol)) {
+      return res.status(400).json({ error: `Rol inválido. Valores permitidos: ${ROLES.join(', ')}` });
     }
 
     const existente = await Usuario.porEmail(email.trim().toLowerCase());
@@ -105,6 +106,7 @@ async function registrar(req, res, next) {
       throw err;
     }
 
+    await auditoria.registrar(req, { accion: 'usuario_creado', entidad: 'usuario', entidad_id: id, nuevo: { email: email.trim().toLowerCase(), rol } });
     res.status(201).json({ message: 'Usuario creado correctamente', id });
   } catch (err) {
     next(err);
@@ -143,6 +145,7 @@ async function cambiarPassword(req, res, next) {
 
     const hash = await bcrypt.hash(password_nuevo, SALT_ROUNDS);
     await Usuario.cambiarPassword(usuario.id, hash);
+    await auditoria.registrar(req, { accion: 'password_cambiada', entidad: 'usuario', entidad_id: usuario.id, anterior: { must_change_password: !!usuario.must_change_password }, nuevo: { must_change_password: false } });
 
     // Nuevo token sin la bandera must_change_password
     const payload = { id: usuario.id, email: usuario.email, rol: usuario.rol, must_change_password: false };
@@ -191,6 +194,7 @@ async function desactivar(req, res, next) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
     await Usuario.desactivar(id);
+    await auditoria.registrar(req, { accion: 'usuario_desactivado', entidad: 'usuario', entidad_id: id, anterior: { email: usuario.email, rol: usuario.rol, activo: true }, nuevo: { activo: false } });
     res.json({ message: 'Usuario desactivado correctamente' });
   } catch (err) {
     next(err);

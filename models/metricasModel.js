@@ -9,7 +9,9 @@
  * Los porcentajes y promedios se calculan aquí a partir de las medidas sumables.
  */
 const db = require('../config/mariadb')
+const config = require('../config')
 const calculo = require('./calculoMetricasModel')
+const tasas = require('./tasasModel')
 
 // Columna de cada filtro de igualdad.
 const IGUALDAD = {
@@ -91,7 +93,9 @@ class metricasModel {
       vendedores: await db.query('SELECT DISTINCT sucursal, vendedor FROM vendedores_mensual ORDER BY sucursal, vendedor'),
       tipos_cliente: await columna('SELECT DISTINCT tipo_cliente FROM segmentos_mensual ORDER BY 1'),
       segmentos_rfm: await columna('SELECT DISTINCT segmento_rfm FROM clientes_metricas WHERE segmento_rfm IS NOT NULL ORDER BY 1'),
-      metodos_pago: await columna('SELECT DISTINCT metodo_pago FROM pagos_mensual ORDER BY 1')
+      metodos_pago: await columna('SELECT DISTINCT metodo_pago FROM pagos_mensual ORDER BY 1'),
+      // Tasa vigente para el selector de moneda del front (los montos de la API están en USD).
+      tasa_vigente: (await tasas.vigente()).tasa
     }
   }
 
@@ -662,6 +666,166 @@ class metricasModel {
 
   proveedores() {
     return db.query('SELECT * FROM proveedores_metricas ORDER BY monto_comprado DESC')
+  }
+
+  // Clasificación A/M/B por rotación, inventario de seguridad y punto de reorden.
+  async inventarioReposicion(f) {
+    const extra = []
+    const params = []
+    if (f.clase) { extra.push('clase_rotacion = ?'); params.push(f.clase) }
+    if (f.estado) { extra.push('estado_stock = ?'); params.push(f.estado) }
+    const w = donde(f, { campos: ['sucursal', 'categoria'] }, extra)
+    const productos = await db.query(`
+      SELECT * FROM inventario_reposicion ${w.sql}
+       ORDER BY FIELD(estado_stock, 'Agotado', 'Bajo stock mínimo', 'Reordenar', 'Normal'), clase_rotacion, indice_rotacion DESC
+       LIMIT ?`, [...params, ...w.params, f.limite])
+    const wr = donde(f, { campos: ['sucursal', 'categoria'] })
+    const clases = await db.query(`
+      SELECT clase_rotacion, COUNT(*) AS productos, SUM(unidades_vendidas) AS unidades_vendidas,
+             ROUND(AVG(indice_rotacion), 2) AS indice_promedio, MIN(indice_rotacion) AS indice_minimo,
+             MAX(indice_rotacion) AS indice_maximo, SUM(estado_stock <> 'Normal') AS con_alerta
+        FROM inventario_reposicion ${wr.sql}
+       GROUP BY clase_rotacion ORDER BY FIELD(clase_rotacion, 'A', 'M', 'B')`, wr.params)
+    const matriz = await db.query(`
+      SELECT categoria, clase_rotacion, COUNT(*) AS productos
+        FROM inventario_reposicion ${wr.sql}
+       GROUP BY categoria, clase_rotacion ORDER BY categoria`, wr.params)
+    const estados = await db.query(`
+      SELECT estado_stock, COUNT(*) AS productos FROM inventario_reposicion ${wr.sql}
+       GROUP BY estado_stock ORDER BY FIELD(estado_stock, 'Agotado', 'Bajo stock mínimo', 'Reordenar', 'Normal')`, wr.params)
+    return { clases, matriz, estados, productos }
+  }
+
+  // Unidades reales vs previsión por mes (suma de los productos filtrados) y error por producto.
+  async prevision(f) {
+    const extra = []
+    const params = []
+    if (f.sku) { extra.push('sku = ?'); params.push(f.sku) }
+    const w = donde(f, { campos: ['categoria'] }, extra)
+    const serie = await db.query(`
+      SELECT mes, SUM(unidades_reales) AS unidades_reales, SUM(promedio_movil) AS promedio_movil,
+             SUM(suavizamiento) AS suavizamiento, MAX(unidades_reales IS NULL) AS pronostico
+        FROM prevision_demanda ${w.sql}
+       GROUP BY mes ORDER BY mes`, [...params, ...w.params])
+    // MAPE del total en los meses donde ambos modelos tienen valor.
+    const error = (col) => {
+      const puntos = serie.filter((s) => !s.pronostico && s.unidades_reales > 0 && s.promedio_movil !== null && s.suavizamiento !== null)
+      if (!puntos.length) return null
+      return Math.round(10000 * puntos.reduce((t, s) => t + Math.abs(s.unidades_reales - s[col]) / s.unidades_reales, 0) / puntos.length) / 100
+    }
+    const productos = await db.query(`
+      SELECT * FROM prevision_metricas ${w.sql} ORDER BY prevision_siguiente DESC LIMIT ?`, [...params, ...w.params, f.limite])
+    return {
+      serie,
+      mape_promedio_movil: error('promedio_movil'),
+      mape_suavizamiento: error('suavizamiento'),
+      productos
+    }
+  }
+
+  // Duplicados exactos (excluidos) y posibles duplicados (para revisión).
+  async duplicados(f) {
+    const [conteo] = await db.query(`
+      SELECT SUM(IF(regla = 'id_duplicado', filas_afectadas, 0)) AS duplicados_exactos,
+             SUM(IF(regla = 'posible_duplicado', filas_afectadas, 0)) AS posibles_duplicados,
+             MAX(total_filas) AS total_filas
+        FROM calidad_datos WHERE dataset = ? AND regla IN ('id_duplicado', 'posible_duplicado')`, [config.metricas.datasets.ventas])
+    const w = donde(f, { fecha: 'fecha', campos: ['sucursal'] })
+    const ventas = await db.query(`
+      SELECT * FROM ventas_posibles_duplicados ${w.sql} ORDER BY fecha_hora DESC LIMIT ?`, [...w.params, f.limite])
+    const [monto] = await db.query(`
+      SELECT COUNT(*) AS ventas, COALESCE(SUM(total), 0) AS monto FROM ventas_posibles_duplicados ${w.sql}`, w.params)
+    return { ...conteo, posibles_en_periodo: monto.ventas, monto_posibles: monto.monto, ventas }
+  }
+
+  // Tablero ejecutivo (Figura 18): indicadores del día y del período y alertas activas.
+  async ejecutivo(f) {
+    const ws = donde(f, { campos: ['sucursal'] })
+    const [ultimo] = await db.query(`SELECT MAX(fecha) AS fecha FROM ventas_diarias ${ws.sql}`, ws.params)
+    const dia = async (fecha) => {
+      if (!fecha) return null
+      const w = donde(f, { campos: ['sucursal'] }, ['fecha = ?'])
+      const [fila] = await db.query(`
+        SELECT ? AS fecha, SUM(transacciones) AS transacciones, SUM(venta_neta) AS venta_neta, SUM(margen) AS margen
+          FROM ventas_diarias ${w.sql}`, [fecha, fecha, ...w.params])
+      return fila
+    }
+    const hoy = await dia(ultimo.fecha)
+    const [anterior] = ultimo.fecha
+      ? await db.query(`SELECT MAX(fecha) AS fecha FROM ventas_diarias ${donde(f, { campos: ['sucursal'] }, ['fecha < ?']).sql}`,
+        [ultimo.fecha, ...ws.params])
+      : [{}]
+    const ayer = await dia(anterior.fecha)
+
+    const wp = donde(f, { fecha: 'fecha', campos: ['sucursal'] })
+    const [periodo] = await db.query(`
+      SELECT SUM(venta_neta) AS venta_neta, SUM(margen) AS margen,
+             ROUND(100 * SUM(margen) / NULLIF(SUM(venta_neta), 0), 2) AS margen_pct
+        FROM ventas_diarias ${wp.sql}`, wp.params)
+
+    const wi = donde(f, { campos: ['sucursal'] })
+    const [stock] = await db.query(`
+      SELECT COUNT(*) AS productos,
+             SUM(estado_stock IN ('Agotado', 'Bajo stock mínimo')) AS bajo_minimo,
+             SUM(estado_stock = 'Agotado') AS agotados,
+             SUM(estado_stock = 'Reordenar') AS por_reordenar
+        FROM inventario_reposicion ${wi.sql}`, wi.params)
+
+    // Riesgo de vencimiento: perecedero cuya existencia tardaría más que su vida útil en venderse.
+    const vencimiento = await db.query(`
+      SELECT sku, producto, categoria, stock_actual, vida_util_dias,
+             ROUND(stock_actual / NULLIF(demanda_diaria, 0), 1) AS dias_para_vender
+        FROM inventario_reposicion
+        ${donde(f, { campos: ['sucursal'] }, ['perecedero = 1', 'stock_actual > 0',
+          '(demanda_diaria = 0 OR stock_actual / demanda_diaria > vida_util_dias)']).sql}
+       ORDER BY dias_para_vender DESC`, wi.params)
+    const reposicion = await db.query(`
+      SELECT sku, producto, categoria, clase_rotacion, estado_stock, stock_actual, stock_seguridad, punto_reorden
+        FROM inventario_reposicion ${donde(f, { campos: ['sucursal'] }, ["estado_stock <> 'Normal'"]).sql}
+       ORDER BY FIELD(estado_stock, 'Agotado', 'Bajo stock mínimo', 'Reordenar'), clase_rotacion`, wi.params)
+
+    const duplicados = await this.duplicados({ ...f, limite: 1 })
+    const tasa = await tasas.vigente()
+    const margenNegativo = await tasas.margenNegativo(5)
+    const alertas = [
+      ...(tasa.vencida ? [{
+        tipo: 'Tasa', nivel: 'alta',
+        titulo: tasa.tasa ? `Tasa de cambio sin actualizar hace ${Math.round(tasa.tasa.horas_sin_actualizar)} horas` : 'No hay tasa de cambio registrada',
+        detalle: tasa.tasa
+          ? `Última: BCV ${tasa.tasa.tasa_bcv} Bs/USD del ${tasa.tasa.fecha} ${tasa.tasa.hora} (${tasa.tasa.origen}) · límite ${tasa.horas_limite} h`
+          : 'Registre la tasa del día en Pagos y monedas'
+      }] : []),
+      ...margenNegativo.map((m) => ({
+        tipo: 'Margen', nivel: 'alta', titulo: `Margen negativo: ${m.producto}`,
+        detalle: `${m.ventas} ventas con pérdida de ${Math.abs(m.margen)} USD · precio ${m.precio_actual} vs costo ${m.costo_actual} · descuento máx. ${m.descuento_maximo} %`
+      })),
+      ...reposicion.map((r) => ({
+        tipo: 'Inventario', nivel: r.estado_stock === 'Reordenar' ? 'media' : 'alta',
+        titulo: `${r.estado_stock}: ${r.producto}`,
+        detalle: `Existencia ${r.stock_actual} · seguridad ${r.stock_seguridad ?? '—'} · reorden ${r.punto_reorden ?? '—'} · clase ${r.clase_rotacion}`
+      })),
+      ...vencimiento.map((v) => ({
+        tipo: 'Vencimiento', nivel: 'media', titulo: `Riesgo de vencimiento: ${v.producto}`,
+        detalle: v.dias_para_vender === null
+          ? `${v.stock_actual} unidades sin ventas · vida útil ${v.vida_util_dias} días`
+          : `${v.stock_actual} unidades tardarían ${v.dias_para_vender} días en venderse · vida útil ${v.vida_util_dias} días`
+      })),
+      ...(duplicados.posibles_duplicados > 0 ? [{
+        tipo: 'Duplicados', nivel: 'media', titulo: `${duplicados.posibles_duplicados} posibles ventas duplicadas`,
+        detalle: 'Revise el módulo Calidad de datos antes de cerrar caja'
+      }] : [])
+    ]
+
+    return {
+      fecha: ultimo.fecha,
+      ventas_dia: hoy,
+      ventas_dia_anterior: ayer,
+      margen: periodo,
+      stock,
+      duplicados: { exactos: duplicados.duplicados_exactos, posibles: duplicados.posibles_duplicados },
+      tasa,
+      alertas
+    }
   }
 
   // --- Calidad de datos ----------------------------------------------------

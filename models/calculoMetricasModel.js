@@ -9,10 +9,13 @@
  *     columnas y tipos de FUENTES. Si a un archivo le falta una columna (p. ej. un
  *     reporte con el formato anterior) llega como null; si el dataset no tiene
  *     archivos, la tabla queda vacía y las métricas que dependen de él también.
- *  2. calc_ventas es la vista de ventas utilizables (con sku, fecha y cantidad > 0)
- *     más columnas derivadas: mes, tipo_cliente, valida, costo, saldo y cobrado.
+ *  2. calc_ventas es la vista de ventas utilizables (con sku, fecha y cantidad > 0),
+ *     sin duplicados exactos (se conserva una fila por id), más columnas derivadas:
+ *     mes, tipo_cliente, valida, costo, saldo y cobrado.
  *  3. Cada entrada de METRICAS es una sentencia fija cuyo resultado se guarda tal
  *     cual en su tabla (los alias del SELECT son las columnas de MariaDB).
+ *  4. La previsión de la demanda (promedio móvil y suavizamiento exponencial simple,
+ *     con su MAPE) se calcula en JS sobre las unidades mensuales por producto.
  */
 const duckdb = require('../config/duckdb');
 const db = require('../config/mariadb');
@@ -30,32 +33,55 @@ const FUENTES = {
     fecha_vencimiento: 'DATE', estado: 'VARCHAR', monto_pagado: 'DOUBLE', fecha_pago: 'DATE', tasa_cambio_pago: 'DOUBLE'
   },
   inventario: {
-    fecha: 'DATE', sucursal: 'VARCHAR', sku: 'VARCHAR', producto: 'VARCHAR', categoria: 'VARCHAR',
-    stock_inicial: 'INTEGER', entradas: 'INTEGER', salidas: 'INTEGER', devoluciones: 'INTEGER', stock_final: 'INTEGER',
+    fecha: 'DATE', sucursal: 'VARCHAR', zona_almacen: 'VARCHAR', sku: 'VARCHAR', producto: 'VARCHAR', categoria: 'VARCHAR',
+    perecedero: 'BOOLEAN', vida_util_dias: 'INTEGER', stock_inicial: 'INTEGER', entradas: 'INTEGER', salidas: 'INTEGER', devoluciones: 'INTEGER', stock_final: 'INTEGER',
     costo_unitario: 'DOUBLE', valor_inventario: 'DOUBLE'
   },
   compras: {
     nro_orden: 'VARCHAR', fecha_orden: 'DATE', fecha_esperada: 'DATE', fecha_recepcion: 'DATE', proveedor: 'VARCHAR',
     sucursal: 'VARCHAR', sku: 'VARCHAR', producto: 'VARCHAR', cantidad: 'INTEGER', costo_unitario: 'DOUBLE', total: 'DOUBLE'
   },
-  metas: { mes: 'DATE', sucursal: 'VARCHAR', vendedor: 'VARCHAR', meta_ventas: 'DOUBLE' }
+  metas: { mes: 'DATE', sucursal: 'VARCHAR', vendedor: 'VARCHAR', meta_ventas: 'DOUBLE' },
+  tasas: { fecha: 'DATE', hora: 'VARCHAR', tasa_bcv: 'DOUBLE', tasa_usdt: 'DOUBLE', tasa_eur: 'DOUBLE', fuente: 'VARCHAR' }
 };
+
+// Temporada del calendario agrícola andino por mes (dimensión tiempo de la Figura 17).
+const TEMPORADA = `CASE
+           WHEN month(fecha) IN (4, 5) THEN 'Siembra (entrada de lluvias)'
+           WHEN month(fecha) IN (6, 7, 8) THEN 'Fertilización y mantenimiento'
+           WHEN month(fecha) IN (9, 10) THEN 'Segundo ciclo de siembra'
+           WHEN month(fecha) IN (11, 12, 1) THEN 'Cosecha'
+           ELSE 'Preparación de tierras' END`;
 
 const CORTE = '(SELECT corte FROM calc_corte)';
 
+// Un mismo id repetido (p. ej. el reporte subido dos veces) es la misma venta: se
+// conserva solo la primera fila para que no se sume dos veces en las métricas.
 const VISTA_VENTAS = `
   CREATE OR REPLACE VIEW calc_ventas AS
   SELECT *,
          CAST(date_trunc('month', fecha) AS DATE)                     AS mes,
          CASE upper(left(identificacion, 1))
-           WHEN 'V' THEN 'Persona natural' WHEN 'J' THEN 'Empresa'
-           WHEN 'E' THEN 'Extranjero' WHEN 'G' THEN 'Gobierno' ELSE 'Otro' END AS tipo_cliente,
+           WHEN 'V' THEN 'Productor' WHEN 'E' THEN 'Productor'
+           WHEN 'J' THEN 'Comercio' WHEN 'G' THEN 'Comercio' ELSE 'Otro' END AS tipo_cliente,
          coalesce(estado NOT IN ('Anulado', 'Devuelto'), true)       AS valida,
          coalesce(costo_unitario, 0) * cantidad                        AS costo,
          if(estado IN ('Pendiente', 'Parcial'), coalesce(total, 0) - coalesce(monto_pagado, 0), 0) AS saldo,
          if(estado IN ('Pagado', 'Parcial'), coalesce(monto_pagado, 0), 0) AS cobrado
     FROM calc_ventas_todo
-   WHERE sku IS NOT NULL AND fecha IS NOT NULL AND cantidad > 0`;
+   WHERE sku IS NOT NULL AND fecha IS NOT NULL AND cantidad > 0
+  QUALIFY id IS NULL OR row_number() OVER (PARTITION BY id ORDER BY fecha_hora) = 1`;
+
+// Posible duplicado: otra venta con distinto id pero mismo cliente, producto, cantidad
+// y total, registrada el mismo día con pocos minutos de diferencia.
+const MINUTOS_POSIBLE_DUPLICADO = 15;
+const POSIBLES_DUPLICADOS = `
+  SELECT b.id
+    FROM calc_ventas a
+    JOIN calc_ventas b
+      ON b.identificacion = a.identificacion AND b.sku = a.sku AND b.cantidad = a.cantidad
+     AND b.total = a.total AND b.fecha = a.fecha AND b.id > a.id
+     AND b.fecha_hora BETWEEN a.fecha_hora AND a.fecha_hora + INTERVAL ${MINUTOS_POSIBLE_DUPLICADO} MINUTE`;
 
 // Medidas comunes de las ventas (sobre calc_ventas). Las ventas anuladas y devueltas
 // no cuentan como venta; se informan aparte.
@@ -412,6 +438,174 @@ const METRICAS = [
         FROM c FULL OUTER JOIN v ON v.proveedor = c.proveedor`
   },
   {
+    // Fórmula (1): SS = Z * σd * √L      Fórmula (2): ROP = d̄ * L + SS
+    // Fórmula (3): IR = unidades vendidas / inventario promedio, en terciles A (alta), M (media), B (baja).
+    // d̄ y σd: media y desviación de la demanda diaria neta; L: días promedio entre orden y
+    // recepción de las compras del producto (o de todas las compras si el producto no tiene).
+    tabla: 'inventario_reposicion',
+    sql: `
+      WITH d AS (
+        SELECT sucursal, sku, fecha, sum(salidas - devoluciones) AS demanda
+          FROM calc_inventario WHERE sku IS NOT NULL AND sucursal IS NOT NULL AND fecha IS NOT NULL
+         GROUP BY ALL
+      ), est AS (
+        SELECT sucursal, sku, avg(demanda) AS demanda_diaria, coalesce(stddev_samp(demanda), 0) AS desviacion,
+               sum(demanda) AS unidades_vendidas
+          FROM d GROUP BY ALL
+      ), i AS (
+        SELECT sucursal, sku, any_value(producto) AS producto, any_value(categoria) AS categoria,
+               any_value(zona_almacen) AS zona_almacen, bool_or(perecedero) AS perecedero,
+               max(vida_util_dias) AS vida_util_dias, arg_max(stock_final, fecha) AS stock_actual,
+               avg(stock_final) AS stock_promedio
+          FROM calc_inventario WHERE sku IS NOT NULL AND sucursal IS NOT NULL
+         GROUP BY ALL
+      ), lt AS (
+        SELECT sucursal, sku, avg(datediff('day', fecha_orden, fecha_recepcion)) AS lead_time
+          FROM calc_compras WHERE fecha_recepcion IS NOT NULL AND sku IS NOT NULL GROUP BY ALL
+      ), lt_global AS (
+        SELECT avg(datediff('day', fecha_orden, fecha_recepcion)) AS lead_time
+          FROM calc_compras WHERE fecha_recepcion IS NOT NULL
+      ), b AS (
+        SELECT i.*, est.demanda_diaria, est.desviacion, est.unidades_vendidas,
+               greatest(1, coalesce(lt.lead_time, lt_global.lead_time)) AS lead_time,
+               est.unidades_vendidas / nullif(i.stock_promedio, 0) AS indice_rotacion
+          FROM i
+          JOIN est ON est.sucursal = i.sucursal AND est.sku = i.sku
+          LEFT JOIN lt ON lt.sucursal = i.sucursal AND lt.sku = i.sku
+          CROSS JOIN lt_global
+      ), c AS (
+        SELECT *, ceil($z * desviacion * sqrt(lead_time)) AS stock_seguridad,
+               ntile(3) OVER (PARTITION BY sucursal ORDER BY coalesce(indice_rotacion, 0) DESC, sku) AS tercil
+          FROM b
+      )
+      SELECT sucursal, sku, producto, categoria, zona_almacen, perecedero, vida_util_dias, stock_actual,
+             round(stock_promedio, 2) AS stock_promedio, unidades_vendidas,
+             round(indice_rotacion, 2) AS indice_rotacion,
+             CASE tercil WHEN 1 THEN 'A' WHEN 2 THEN 'M' ELSE 'B' END AS clase_rotacion,
+             round(demanda_diaria, 3) AS demanda_diaria, round(desviacion, 3) AS desviacion_demanda,
+             round(lead_time, 1) AS lead_time_dias, stock_seguridad,
+             ceil(demanda_diaria * lead_time + stock_seguridad) AS punto_reorden,
+             CASE WHEN stock_actual <= 0 THEN 'Agotado'
+                  WHEN stock_actual < stock_seguridad THEN 'Bajo stock mínimo'
+                  WHEN stock_actual <= ceil(demanda_diaria * lead_time + stock_seguridad) THEN 'Reordenar'
+                  ELSE 'Normal' END AS estado_stock
+        FROM c`,
+    parametros: () => ({ z: config.metricas.nivelServicioZ })
+  },
+  {
+    tabla: 'ventas_posibles_duplicados',
+    sql: `
+      WITH p AS (${POSIBLES_DUPLICADOS})
+      SELECT v.id, v.fecha, v.fecha_hora, v.cliente, v.identificacion, v.sku, v.producto, v.cantidad,
+             round(v.total, 2) AS total, v.vendedor, v.sucursal
+        FROM calc_ventas v
+       WHERE v.id IN (SELECT id FROM p)`
+  },
+  {
+    // Ventas con margen negativo (base imponible menor que el costo) por producto (6.4.4.4).
+    tabla: 'alertas_margen',
+    sql: `
+      SELECT sku, any_value(producto) AS producto, any_value(categoria) AS categoria,
+             count(*) AS ventas, sum(cantidad) AS unidades,
+             round(sum(base_imponible), 2) AS venta_neta, round(sum(base_imponible - costo), 2) AS margen,
+             max(fecha) AS ultima_fecha,
+             round(arg_max(precio, fecha), 2) AS precio_actual, round(arg_max(costo_unitario, fecha), 2) AS costo_actual,
+             round(max(coalesce(descuento_pct, 0)), 2) AS descuento_maximo
+        FROM calc_ventas
+       WHERE valida AND base_imponible < costo
+       GROUP BY sku`
+  },
+
+  // --- Modelo dimensional (Figura 17): dimensiones y hechos con claves lógicas ----------
+  {
+    tabla: 'dim_tiempo',
+    sql: `
+      WITH r AS (
+        SELECT least((SELECT min(fecha) FROM calc_ventas), coalesce((SELECT min(fecha) FROM calc_inventario), DATE '9999-12-31')) AS desde,
+               greatest((SELECT max(fecha) FROM calc_ventas), coalesce((SELECT max(fecha) FROM calc_inventario), DATE '0001-01-01')) AS hasta
+      ), d AS (
+        SELECT CAST(unnest(generate_series(desde, hasta, INTERVAL 1 DAY)) AS DATE) AS fecha FROM r WHERE desde IS NOT NULL
+      )
+      SELECT fecha, year(fecha) AS anio, quarter(fecha) AS trimestre, month(fecha) AS mes,
+             CAST(date_trunc('month', fecha) AS DATE) AS primer_dia_mes, day(fecha) AS dia,
+             isodow(fecha) AS dia_semana, isodow(fecha) >= 6 AS fin_de_semana,
+             ${TEMPORADA} AS temporada_agricola
+        FROM d`
+  },
+  {
+    tabla: 'dim_producto',
+    sql: `
+      WITH i AS (
+        SELECT sku, any_value(producto) AS producto, any_value(categoria) AS categoria,
+               any_value(zona_almacen) AS zona_almacen, bool_or(perecedero) AS perecedero, max(vida_util_dias) AS vida_util_dias
+          FROM calc_inventario WHERE sku IS NOT NULL GROUP BY sku
+      ), v AS (
+        SELECT sku, arg_max(producto, fecha) AS producto, any_value(categoria) AS categoria, any_value(marca) AS marca,
+               any_value(proveedor) AS proveedor, arg_max(precio, fecha) AS precio, arg_max(costo_unitario, fecha) AS costo_unitario
+          FROM calc_ventas GROUP BY sku
+      )
+      SELECT coalesce(v.sku, i.sku) AS sku, coalesce(v.producto, i.producto) AS producto,
+             coalesce(v.categoria, i.categoria) AS categoria, v.marca, v.proveedor,
+             i.zona_almacen, i.perecedero, i.vida_util_dias, round(v.precio, 2) AS precio, round(v.costo_unitario, 2) AS costo_unitario
+        FROM v FULL OUTER JOIN i ON i.sku = v.sku`
+  },
+  {
+    tabla: 'dim_cliente',
+    sql: `
+      SELECT identificacion, arg_max(cliente, fecha) AS cliente, any_value(tipo_cliente) AS tipo_cliente,
+             min(fecha_alta_cliente) AS fecha_alta
+        FROM calc_ventas WHERE identificacion IS NOT NULL GROUP BY identificacion`
+  },
+  {
+    // Una tasa por día: la última registrada en el reporte de tasas; si ese día no hay
+    // reporte, la BCV promedio de las ventas.
+    tabla: 'dim_tasa',
+    sql: `
+      WITH t AS (
+        SELECT fecha, max(hora) AS hora, arg_max(tasa_bcv, hora) AS tasa_bcv, arg_max(tasa_usdt, hora) AS tasa_usdt,
+               arg_max(tasa_eur, hora) AS tasa_eur, arg_max(fuente, hora) AS fuente
+          FROM calc_tasas WHERE fecha IS NOT NULL AND tasa_bcv > 0 GROUP BY fecha
+      ), v AS (
+        SELECT fecha, avg(tasa_cambio) AS tasa FROM calc_ventas WHERE tasa_cambio > 0 GROUP BY fecha
+      )
+      SELECT coalesce(t.fecha, v.fecha) AS fecha, t.hora, round(coalesce(t.tasa_bcv, v.tasa), 4) AS tasa_bcv,
+             round(t.tasa_usdt, 4) AS tasa_usdt, round(t.tasa_eur, 4) AS tasa_eur,
+             coalesce(t.fuente, 'Ventas (promedio BCV)') AS fuente
+        FROM t FULL OUTER JOIN v ON v.fecha = t.fecha`
+  },
+  {
+    tabla: 'dim_zona',
+    sql: `
+      SELECT zona_almacen,
+             CASE zona_almacen WHEN 'Cuarto frío' THEN 'Refrigerada' WHEN 'Agroquímicos' THEN 'Controlada (químicos)'
+                  WHEN 'Patio' THEN 'Exterior' ELSE 'Seca' END AS tipo,
+             count(DISTINCT sku) AS productos
+        FROM calc_inventario WHERE zona_almacen IS NOT NULL GROUP BY zona_almacen`
+  },
+  {
+    tabla: 'hechos_ventas',
+    sql: `
+      SELECT v.id, v.fecha, v.sku, v.identificacion, p.zona_almacen, v.vendedor, v.metodo_pago, v.moneda,
+             v.condicion_pago, v.estado, v.valida, v.cantidad, round(v.precio, 2) AS precio,
+             round(coalesce(v.descuento, 0), 2) AS descuento, round(v.base_imponible, 2) AS base_imponible,
+             round(v.iva, 2) AS iva, round(v.total, 2) AS total, round(v.costo, 2) AS costo,
+             round(v.base_imponible - v.costo, 2) AS margen, v.tasa_cambio
+        FROM calc_ventas v
+        LEFT JOIN (SELECT sku, any_value(zona_almacen) AS zona_almacen FROM calc_inventario GROUP BY sku) p ON p.sku = v.sku
+       WHERE v.id IS NOT NULL`
+  },
+  {
+    tabla: 'hechos_inventario',
+    sql: `
+      SELECT fecha, sku, any_value(zona_almacen) AS zona_almacen, sum(stock_inicial) AS stock_inicial,
+             sum(entradas) AS entradas, sum(salidas) AS salidas, sum(devoluciones) AS devoluciones,
+             sum(stock_final) AS stock_final, round(avg(costo_unitario), 2) AS costo_unitario,
+             round(sum(valor_inventario), 2) AS valor_inventario
+        FROM calc_inventario
+       WHERE fecha IS NOT NULL AND sku IS NOT NULL
+       GROUP BY fecha, sku`
+  },
+  {
     tabla: 'productos_top',
     sql: `
       SELECT producto AS nombre, sum(cantidad) AS cantidad
@@ -437,7 +631,8 @@ const CALIDAD = {
     { regla: 'pago_antes_de_venta', descripcion: 'Fecha de pago anterior a la fecha de venta', condicion: 'fecha_pago < fecha' },
     { regla: 'pago_mayor_total', descripcion: 'Monto pagado mayor que el total', condicion: 'monto_pagado > total + 0.05' },
     { regla: 'venta_antes_del_alta', descripcion: 'Venta anterior a la fecha de alta del cliente', condicion: 'fecha < fecha_alta_cliente' },
-    { regla: 'id_duplicado', descripcion: 'Filas con un id repetido (p. ej. el mismo reporte subido dos veces)', conteo: 'count(id) - count(DISTINCT id)' },
+    { regla: 'id_duplicado', descripcion: 'Filas con un id repetido (p. ej. el mismo reporte subido dos veces); se excluyen de las métricas', conteo: 'count(id) - count(DISTINCT id)' },
+    { regla: 'posible_duplicado', descripcion: `Ventas con otro id pero mismo cliente, producto, cantidad y total en menos de ${MINUTOS_POSIBLE_DUPLICADO} minutos`, conteo: `(SELECT count(DISTINCT id) FROM (${POSIBLES_DUPLICADOS}))` },
     { regla: 'identificacion_varios_nombres', descripcion: 'Identificaciones registradas con más de un nombre de cliente', conteo: '(SELECT count(*) FROM (SELECT identificacion FROM calc_ventas_todo WHERE identificacion IS NOT NULL GROUP BY 1 HAVING count(DISTINCT cliente) > 1))' }
   ],
   inventario: [
@@ -451,11 +646,101 @@ const CALIDAD = {
     { regla: 'total_inconsistente', descripcion: 'Total distinto de cantidad * costo unitario', condicion: 'abs(cantidad * costo_unitario - total) > 0.05' },
     { regla: 'orden_duplicada', descripcion: 'Filas con un número de orden repetido', conteo: 'count(nro_orden) - count(DISTINCT nro_orden)' }
   ],
+  tasas: [
+    { regla: 'tasa_no_positiva', descripcion: 'Tasa BCV vacía, cero o negativa', condicion: 'coalesce(tasa_bcv, 0) <= 0' },
+    { regla: 'usdt_menor_bcv', descripcion: 'Tasa USDT menor que la BCV (brecha negativa, posible error de captura)', condicion: 'tasa_usdt < tasa_bcv' },
+    { regla: 'fecha_invalida', descripcion: 'Fecha vacía o inválida', condicion: 'fecha IS NULL' },
+    { regla: 'dias_sin_tasa', descripcion: 'Días con ventas sin tasa en el reporte de tasas', conteo: '(SELECT count(DISTINCT fecha) FROM calc_ventas WHERE fecha NOT IN (SELECT fecha FROM calc_tasas WHERE fecha IS NOT NULL))' }
+  ],
   metas: [
     { regla: 'meta_no_positiva', descripcion: 'Meta vacía, cero o negativa', condicion: 'coalesce(meta_ventas, 0) <= 0' },
     { regla: 'vendedor_sin_ventas', descripcion: 'Metas de vendedores sin ventas registradas en ese mes y sucursal', condicion: "NOT EXISTS (SELECT 1 FROM calc_ventas v WHERE v.vendedor = calc_metas.vendedor AND v.sucursal = calc_metas.sucursal AND v.mes = CAST(date_trunc('month', calc_metas.mes) AS DATE))" }
   ]
 };
+
+// --- Previsión de la demanda --------------------------------------------------
+// Por producto y mes: promedio móvil de VENTANA meses y suavizamiento exponencial simple
+// (F[t+1] = α·Y[t] + (1 − α)·F[t], con F[1] = Y[0]). El MAPE de ambos se mide en los
+// mismos meses (desde el mes VENTANA) para compararlos; se recomienda el de menor MAPE.
+// Holt-Winters requiere al menos doce meses de historia por estacionalidad y queda fuera.
+
+const VENTANA = 3;
+
+function sumarMes(mes, n) {
+  const [a, m] = mes.split('-').map(Number);
+  const f = new Date(Date.UTC(a, m - 1 + n, 1));
+  return f.toISOString().slice(0, 10);
+}
+
+function mape(reales, previstos, desde) {
+  let suma = 0;
+  let n = 0;
+  for (let t = desde; t < reales.length; t++) {
+    if (reales[t] > 0 && previstos[t] !== null) { suma += Math.abs(reales[t] - previstos[t]) / reales[t]; n++ }
+  }
+  return n ? Math.round(10000 * suma / n) / 100 : null;
+}
+
+const r2 = (v) => (v === null ? null : Math.round(v * 100) / 100);
+
+async function prevision(alfa) {
+  // Solo meses completos: el mes del corte entra si el corte es su último día.
+  const filas = await duckdb.consultar(`
+    SELECT strftime(mes, '%Y-%m-%d') AS mes, sku, any_value(producto) AS producto, any_value(categoria) AS categoria,
+           CAST(sum(cantidad) AS DOUBLE) AS unidades
+      FROM calc_ventas
+     WHERE valida AND mes < (SELECT CAST(date_trunc('month', corte + INTERVAL 1 DAY) AS DATE) FROM calc_corte)
+     GROUP BY mes, sku
+     ORDER BY sku, mes`);
+  if (!filas.length) return { prevision_demanda: [], prevision_metricas: [] };
+
+  const meses = [...new Set(filas.map((f) => f.mes))].sort();
+  const todos = [];
+  for (let m = meses[0]; m <= meses[meses.length - 1]; m = sumarMes(m, 1)) todos.push(m);
+  const siguiente = sumarMes(todos[todos.length - 1], 1);
+
+  const porSku = new Map();
+  for (const f of filas) {
+    if (!porSku.has(f.sku)) porSku.set(f.sku, { producto: f.producto, categoria: f.categoria, unidades: new Map() });
+    porSku.get(f.sku).unidades.set(f.mes, f.unidades);
+  }
+
+  const demanda = [];
+  const metricas = [];
+  for (const [sku, p] of porSku) {
+    const y = todos.map((m) => p.unidades.get(m) || 0);
+    const pm = y.map((_, t) => (t >= VENTANA ? y.slice(t - VENTANA, t).reduce((a, b) => a + b, 0) / VENTANA : null));
+    const ses = [null];
+    let nivel = y[0];
+    for (let t = 1; t <= y.length; t++) {
+      ses.push(nivel);
+      if (t < y.length) nivel = alfa * y[t] + (1 - alfa) * nivel;
+    }
+    const pmSiguiente = y.length >= VENTANA ? y.slice(-VENTANA).reduce((a, b) => a + b, 0) / VENTANA : null;
+    const sesSiguiente = ses[y.length];
+
+    todos.forEach((mes, t) => demanda.push({
+      mes, sku, producto: p.producto, categoria: p.categoria, unidades_reales: y[t],
+      promedio_movil: r2(pm[t]), suavizamiento: r2(ses[t])
+    }));
+    demanda.push({
+      mes: siguiente, sku, producto: p.producto, categoria: p.categoria, unidades_reales: null,
+      promedio_movil: r2(pmSiguiente), suavizamiento: r2(sesSiguiente)
+    });
+
+    const mapePm = mape(y, pm, VENTANA);
+    const mapeSes = mape(y, ses.slice(0, y.length), VENTANA);
+    const recomendado = mapePm === null && mapeSes === null ? null
+      : mapeSes === null || (mapePm !== null && mapePm < mapeSes) ? 'Promedio móvil' : 'Suavizamiento exponencial';
+    metricas.push({
+      sku, producto: p.producto, categoria: p.categoria, meses: y.length,
+      unidades_ultimo_mes: y[y.length - 1], mape_promedio_movil: mapePm, mape_suavizamiento: mapeSes,
+      modelo_recomendado: recomendado, mes_siguiente: siguiente,
+      prevision_siguiente: r2(recomendado === 'Promedio móvil' ? pmSiguiente : sesSiguiente)
+    });
+  }
+  return { prevision_demanda: demanda, prevision_metricas: metricas };
+}
 
 function identificador(nombre) {
   return '"' + String(nombre).replace(/"/g, '""') + '"';
@@ -514,7 +799,7 @@ async function reemplazar(conexion, tabla, filas) {
 
 async function limpiar() {
   await duckdb.consultar('DROP VIEW IF EXISTS calc_ventas');
-  for (const t of ['calc_ventas_todo', 'calc_inventario', 'calc_compras', 'calc_metas', 'calc_corte']) {
+  for (const t of ['calc_ventas_todo', 'calc_inventario', 'calc_compras', 'calc_metas', 'calc_tasas', 'calc_corte']) {
     await duckdb.consultar(`DROP TABLE IF EXISTS ${t}`);
   }
 }
@@ -532,6 +817,7 @@ async function calcular() {
   for (const m of METRICAS) {
     resultados[m.tabla] = await duckdb.consultar(m.sql, m.parametros ? m.parametros() : undefined);
   }
+  Object.assign(resultados, await prevision(config.metricas.alfaSuavizamiento));
   resultados.calidad_datos = [];
   for (const nombre of Object.keys(CALIDAD)) {
     resultados.calidad_datos.push(...await calidad(nombre, disponibles[nombre]));

@@ -1,26 +1,17 @@
 /**
  * Datos fijos del negocio que usa el generador de reportes (scripts/generar-ventas.js):
- * sucursales con su ubicación, vendedores, métodos de pago, plazos de crédito y proveedores.
+ * la sede única de la agrocomercializadora en Trujillo, sus vendedores, métodos de pago,
+ * plazos de crédito, proveedores y la estacionalidad agrícola de cada categoría.
  * Los pesos indican qué tanto se usa cada opción; no tienen que sumar 1.
  */
 
 const sucursales = [
-  { sucursal: 'Caracas Centro', ciudad: 'Caracas', estado_geo: 'Distrito Capital', peso: 30 },
-  { sucursal: 'Valencia Norte', ciudad: 'Valencia', estado_geo: 'Carabobo', peso: 20 },
-  { sucursal: 'Maracaibo', ciudad: 'Maracaibo', estado_geo: 'Zulia', peso: 18 },
-  { sucursal: 'Barquisimeto', ciudad: 'Barquisimeto', estado_geo: 'Lara', peso: 14 },
-  { sucursal: 'Maracay', ciudad: 'Maracay', estado_geo: 'Aragua', peso: 10 },
-  { sucursal: 'San Cristóbal', ciudad: 'San Cristóbal', estado_geo: 'Táchira', peso: 8 }
+  { sucursal: 'Sede Trujillo', ciudad: 'Trujillo', estado_geo: 'Trujillo', peso: 1 }
 ];
 
-// Vendedores por sucursal; el peso refleja su desempeño (cuántas ventas cierra).
+// Vendedores (parte de los seis colaboradores de la empresa); el peso refleja cuántas ventas cierra.
 const vendedores = {
-  'Caracas Centro': [['María Fernández', 9], ['José Rodríguez', 7], ['Luisa Medina', 5], ['Carlos Pérez', 3]],
-  'Valencia Norte': [['Ana Torres', 8], ['Pedro Salazar', 6], ['Gabriela Ruiz', 4]],
-  'Maracaibo': [['Daniel Urdaneta', 8], ['Carmen Villalobos', 7], ['Jesús Finol', 3]],
-  'Barquisimeto': [['Rosa Mendoza', 7], ['Andrés Colmenárez', 5]],
-  'Maracay': [['Patricia Lugo', 6], ['Miguel Ochoa', 4]],
-  'San Cristóbal': [['Fernando Contreras', 6], ['Diana Chacón', 4]]
+  'Sede Trujillo': [['María Araujo', 6], ['José Valera', 5], ['Luisa Barrios', 3]]
 };
 
 // moneda: en qué moneda paga el cliente. comision: % del total que cobra el banco o la pasarela.
@@ -33,30 +24,48 @@ const metodosPago = {
   'Punto de Venta': { moneda: 'VES', comision: 2.0 }
 };
 
-// Preferencia de método de pago según el tipo de cliente (prefijo de la identificación).
+// Tipo de cliente según el prefijo de la identificación: V/E son productores (personas
+// naturales que siembran o crían) y J/G son comercios (bodegas, agropecuarias, abastos).
+const tipoCliente = { V: 'Productor', E: 'Productor', J: 'Comercio', G: 'Comercio' };
+
+// Preferencia de método de pago según el prefijo de la identificación.
 const pagosPorTipo = {
-  V: [['Pago Móvil', 30], ['Punto de Venta', 25], ['Efectivo USD', 20], ['Zelle', 10], ['Transferencia', 10], ['Efectivo Bs', 5]],
-  E: [['Efectivo USD', 40], ['Zelle', 30], ['Punto de Venta', 20], ['Pago Móvil', 10]],
-  J: [['Transferencia', 60], ['Zelle', 20], ['Pago Móvil', 10], ['Efectivo USD', 10]],
-  G: [['Transferencia', 90], ['Pago Móvil', 10]]
+  V: [['Efectivo USD', 30], ['Pago Móvil', 30], ['Punto de Venta', 15], ['Efectivo Bs', 15], ['Zelle', 5], ['Transferencia', 5]],
+  E: [['Efectivo USD', 40], ['Pago Móvil', 30], ['Zelle', 15], ['Punto de Venta', 15]],
+  J: [['Transferencia', 50], ['Zelle', 20], ['Pago Móvil', 20], ['Efectivo USD', 10]],
+  G: [['Transferencia', 70], ['Pago Móvil', 30]]
 };
 
-// Ventas a crédito por tipo de cliente: probabilidad, plazos posibles (días) y
-// atraso típico del pago respecto al vencimiento (días, puede ser negativo = paga antes).
+// Ventas a crédito: los productores compran a crédito para pagar con la cosecha (plazo
+// largo y atraso frecuente); los comercios pagan a 15 o 30 días.
 const credito = {
-  V: { probabilidad: 0.05, plazos: [15], atraso: [-5, 10] },
-  E: { probabilidad: 0.02, plazos: [15], atraso: [-5, 10] },
-  J: { probabilidad: 0.7, plazos: [15, 30], atraso: [-5, 20] },
-  G: { probabilidad: 0.9, plazos: [45], atraso: [5, 60] }
+  V: { probabilidad: 0.15, plazos: [30, 60], atraso: [-5, 25] },
+  E: { probabilidad: 0.1, plazos: [30], atraso: [-5, 20] },
+  J: { probabilidad: 0.55, plazos: [15, 30], atraso: [-5, 15] },
+  G: { probabilidad: 0.55, plazos: [15, 30], atraso: [-5, 15] }
 };
 
 // Días que tarda cada proveedor en entregar y qué tan seguido se retrasa.
 const proveedores = {
-  'Importadora Orinoco': { entrega: 12, probRetraso: 0.25 },
-  'Tecno Suministros del Lago': { entrega: 8, probRetraso: 0.15 },
-  'Distribuidora Caribe': { entrega: 6, probRetraso: 0.1 },
-  'Comercial Ávila': { entrega: 5, probRetraso: 0.05 },
-  'Distribuidora Los Andes': { entrega: 9, probRetraso: 0.4 }
+  'Agroinsumos Andinos': { entrega: 7, probRetraso: 0.25 },
+  'Semillas del Llano': { entrega: 10, probRetraso: 0.2 },
+  'Alimentos Balanceados Monay': { entrega: 3, probRetraso: 0.1 },
+  'Distribuidora Agropecuaria Boconó': { entrega: 5, probRetraso: 0.15 },
+  'Productores Asociados de Trujillo': { entrega: 1, probRetraso: 0.05 }
 };
 
-module.exports = { sucursales, vendedores, metodosPago, pagosPorTipo, credito, proveedores };
+// Factor de demanda por mes (enero..diciembre) según el calendario agrícola andino:
+// siembra con la entrada de lluvias (abril-mayo), fertilización (junio-julio), segundo
+// ciclo (septiembre-octubre) y cosecha (noviembre-enero).
+const ESTACION_BASE = [0.8, 0.85, 1.0, 1.15, 1.2, 1.1, 1.05, 0.95, 1.05, 1.1, 0.95, 0.85];
+const estacionalidad = {
+  'Semillas': [0.5, 0.6, 1.2, 2.0, 1.8, 0.9, 0.6, 0.6, 1.4, 1.5, 0.6, 0.4],
+  'Fertilizantes': [0.6, 0.6, 0.9, 1.3, 1.5, 1.7, 1.5, 1.0, 1.1, 1.3, 0.8, 0.5],
+  'Agroquímicos': [0.6, 0.6, 0.8, 1.1, 1.4, 1.5, 1.4, 1.2, 1.1, 1.2, 0.9, 0.6],
+  'Rubros perecederos': [1.4, 1.1, 0.9, 0.8, 0.8, 0.9, 1.0, 1.1, 1.0, 0.9, 1.3, 1.6],
+  'Alimento animal': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.05, 1.1],
+  'Veterinarios': [0.9, 0.9, 1.0, 1.2, 1.1, 1.0, 0.9, 0.9, 1.2, 1.1, 0.9, 0.9],
+  'Herramientas y riego': [1.2, 1.3, 1.3, 1.1, 0.9, 0.8, 0.8, 0.9, 1.0, 1.0, 0.9, 0.9]
+};
+
+module.exports = { sucursales, vendedores, metodosPago, tipoCliente, pagosPorTipo, credito, proveedores, ESTACION_BASE, estacionalidad };

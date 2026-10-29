@@ -3,6 +3,9 @@
  * Solo se usa desde authController; no se expone directamente a las rutas.
  */
 const db = require('../config/mariadb');
+const { LISTA: ROLES } = require('../config/roles');
+
+const ENUM_ROLES = `ENUM(${ROLES.map((r) => `'${r}'`).join(',')})`;
 
 // Asegura que la tabla exista (puede correr en paralelo con el iniciar() de mariadb.js)
 const CREAR_TABLA = `
@@ -10,7 +13,7 @@ const CREAR_TABLA = `
     id               INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     email            VARCHAR(255) NOT NULL UNIQUE,
     password_hash    VARCHAR(255) NOT NULL,
-    rol              ENUM('vendedor','gerente','administrador') NOT NULL DEFAULT 'vendedor',
+    rol              ${ENUM_ROLES} NOT NULL DEFAULT 'vendedor',
     must_change_password TINYINT(1) NOT NULL DEFAULT 1,
     activo           TINYINT(1) NOT NULL DEFAULT 1,
     creado_por       INT UNSIGNED NULL,
@@ -31,7 +34,7 @@ function asegurarTabla() {
       const columnas = await db.query('SHOW COLUMNS FROM usuarios');
       const existentes = new Set(columnas.map((columna) => columna.Field));
       const migraciones = [
-        ['rol', "ALTER TABLE usuarios ADD COLUMN rol ENUM('vendedor','gerente','administrador') NOT NULL DEFAULT 'vendedor'"],
+        ['rol', `ALTER TABLE usuarios ADD COLUMN rol ${ENUM_ROLES} NOT NULL DEFAULT 'vendedor'`],
         ['must_change_password', 'ALTER TABLE usuarios ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 1'],
         ['activo', 'ALTER TABLE usuarios ADD COLUMN activo TINYINT(1) NOT NULL DEFAULT 1'],
         ['creado_por', 'ALTER TABLE usuarios ADD COLUMN creado_por INT UNSIGNED NULL'],
@@ -41,6 +44,12 @@ function asegurarTabla() {
 
       for (const [nombre, sql] of migraciones) {
         if (!existentes.has(nombre)) await db.query(sql);
+      }
+
+      // Roles de la Tabla 18: amplía el ENUM de instalaciones con solo tres roles.
+      const rol = columnas.find((columna) => columna.Field === 'rol');
+      if (rol && ROLES.some((r) => !String(rol.Type).includes(`'${r}'`))) {
+        await db.query(`ALTER TABLE usuarios MODIFY rol ${ENUM_ROLES} NOT NULL DEFAULT 'vendedor'`);
       }
     })().catch((err) => { tablaLista = null; throw err; });
   }
