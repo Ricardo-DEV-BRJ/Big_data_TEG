@@ -1,20 +1,24 @@
-# Base de datos de servicio (métricas). MinIO ya corre como contenedor aparte
-# (minio-server); si se necesita en otra máquina: docker compose --profile minio up -d
 services:
   minio:
-    # profiles: ["minio"]
     image: pgsty/silo
-    container_name: minio-server
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    expose:
+      - "9000"
+      - "9001"
     volumes:
       - minio_data:/data
+    networks:
+      - dokploy-network
+    labels:
+      - traefik.docker.network=dokploy-network
     restart: unless-stopped
 
 volumes:
   minio_data:
+
+networks:
+  dokploy-network:
+    external: true
