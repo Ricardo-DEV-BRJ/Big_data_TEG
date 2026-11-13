@@ -1,8 +1,63 @@
--- Esquema de métricas para el front (MariaDB / MySQL).
+-- Esquema completo de la base de servicio (MariaDB / MySQL).
 -- config/mariadb.js ejecuta este archivo al arrancar (CREATE TABLE IF NOT EXISTS), así
--- que no hace falta correrlo a mano. Las tablas las llena models/calculoMetricasModel.js
--- (POST /api/metricas/recalcular o la tarea programada) a partir de los Parquet del
--- data lake; el front solo las lee con GET /api/metricas/...
+-- que no hace falta correrlo a mano; también se puede ejecutar sobre una base vacía:
+--   mysql -u root -p servicio < tablas.sql
+-- Contiene: usuarios, ingestas, las tablas de métricas, el esquema en estrella,
+-- la auditoría y la calidad de datos.
+
+-- ============================================================
+-- Autenticación y control de acceso basado en roles
+-- ============================================================
+
+-- Usuarios del sistema. Roles de la Tabla 18: gerente (Gerencia), administracion
+-- (Administración), vendedor (Ventas), almacen (Almacén), administrador (Soporte TI).
+CREATE TABLE IF NOT EXISTS usuarios (
+  id               INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  email            VARCHAR(255) NOT NULL UNIQUE,
+  password_hash    VARCHAR(255) NOT NULL,
+  rol              ENUM('gerente', 'administracion', 'vendedor', 'almacen', 'administrador') NOT NULL DEFAULT 'vendedor',
+  must_change_password TINYINT(1) NOT NULL DEFAULT 1,
+  activo           TINYINT(1) NOT NULL DEFAULT 1,
+  creado_por       INT UNSIGNED NULL,        -- id del administrador que lo creó
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX usuarios_email (email),
+  INDEX usuarios_rol (rol)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Administrador inicial (contraseña: Admin1234!, se exige cambiarla en el primer login).
+-- Solo se crea si todavía no existe ningún administrador, así no reaparece en cada arranque.
+-- Regenerar el hash con: node -e "require('bcryptjs').hash('Admin1234!',12).then(console.log)"
+INSERT INTO usuarios (email, password_hash, rol, must_change_password)
+SELECT 'admin@bigagrojm.com', '$2b$12$DyjcPs2WI/vcoS5fPZpGnOCj7krGT8dh2GT1XnHVF3zIsQ9RwuQ8q', 'administrador', 1
+FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE rol = 'administrador');
+
+-- ============================================================
+-- Registro de cada CSV subido al data lake
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS ingestas (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  dataset VARCHAR(128) NOT NULL,
+  fecha DATE NOT NULL,
+  archivo_origen VARCHAR(512) NOT NULL,
+  clave_parquet VARCHAR(1024) NOT NULL,
+  filas BIGINT NOT NULL,
+  bytes_csv BIGINT,
+  bytes_parquet BIGINT,
+  segundos DECIMAL(10,2),
+  origen VARCHAR(16) NOT NULL DEFAULT 'api',
+  creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX ingestas_dataset_fecha (dataset, fecha)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- Métricas para el front
+-- ============================================================
+-- Las llena models/calculoMetricasModel.js (POST /api/metricas/recalcular o la tarea
+-- programada) a partir de los Parquet del data lake; el front solo las lee con
+-- GET /api/metricas/...
 -- Convenciones:
 --   venta_neta     base imponible (sin IVA) de las ventas válidas (sin Anulado ni Devuelto)
 --   total          monto con IVA

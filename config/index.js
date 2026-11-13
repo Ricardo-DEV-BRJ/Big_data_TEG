@@ -1,5 +1,8 @@
 const path = require('path');
 
+// Algunos paneles (docker --env-file, Dokploy) conservan las comillas del valor: "0 2 * * *".
+const sinComillas = (v) => (v ? v.trim().replace(/^(["'])(.*)\1$/, '$2') : v);
+
 module.exports = {
   minio: {
     endPoint: process.env.MINIO_ENDPOINT || 'localhost',
@@ -23,7 +26,7 @@ module.exports = {
   },
   respaldo: {
     // Expresión cron "minuto hora día mes día-semana"; por defecto, todos los días a las 02:00.
-    horario: process.env.RESPALDO_CRON || '0 2 * * *',
+    horario: sinComillas(process.env.RESPALDO_CRON) || '0 2 * * *',
     // Zona horaria IANA (p. ej. America/Caracas); sin definir, se usa la hora local del servidor.
     zona: process.env.RESPALDO_ZONA || undefined,
     // Segunda copia en otro medio (disco externo, NAS o carpeta sincronizada con la nube).
@@ -32,11 +35,11 @@ module.exports = {
   },
   metricas: {
     // Recálculo de las tablas de métricas; por defecto, todos los días a las 02:30 (después del respaldo).
-    horario: process.env.METRICAS_CRON || '30 2 * * *',
+    horario: sinComillas(process.env.METRICAS_CRON) || '30 2 * * *',
     zona: process.env.RESPALDO_ZONA || undefined,
     // Revisión frecuente (6.4.4.2): si llegaron reportes nuevos (p. ej. existencias) desde el
     // último cálculo, recalcula; si no, no hace nada. Por defecto, cada 15 minutos.
-    horarioIncremental: process.env.METRICAS_INCREMENTAL_CRON || '*/15 * * * *',
+    horarioIncremental: sinComillas(process.env.METRICAS_INCREMENTAL_CRON) || '*/15 * * * *',
     // Datasets (carpetas del bucket) de donde salen las métricas.
     datasets: {
       ventas: process.env.DATASET_VENTAS || 'ventas',

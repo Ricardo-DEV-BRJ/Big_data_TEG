@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "start": "node --env-file=.env ./bin/www",
+    "start": "node --env-file-if-exists=.env ./bin/www",
     "dev": "docker start minio-server && nodemon --exec \"node --env-file=.env\" ./bin/www",
     "csv-prueba": "node scripts/generar-csv-prueba.js",
     "csv": "node scripts/generar-ventas.js"
@@ -23,5 +23,8 @@
     "mysql2": "^3.24.6",
     "node-cron": "^4.6.0",
     "nodemon": "^3.1.14"
+  },
+  "engines": {
+    "node": ">=22.9"
   }
 }
