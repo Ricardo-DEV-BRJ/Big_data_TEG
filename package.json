@@ -6,7 +6,9 @@
     "start": "node --env-file=.env ./bin/www",
     "dev": "docker start minio-server && nodemon --exec \"node --env-file=.env\" ./bin/www",
     "csv-prueba": "node scripts/generar-csv-prueba.js",
-    "csv": "node scripts/generar-ventas.js"
+    "csv": "node --env-file=.env scripts/generar-ventas.js",
+    "csv-duplicados": "node --env-file=.env scripts/generar-duplicados.js",
+    "extraccion": "node --env-file=.env tareas/extraccion.js"
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.6-r.2",

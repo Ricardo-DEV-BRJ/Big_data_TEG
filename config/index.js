@@ -30,6 +30,15 @@ module.exports = {
     directorio: path.resolve(process.env.RESPALDO_DIR || path.join(__dirname, '..', 'respaldos')),
     retencionDias: parseInt(process.env.RESPALDO_RETENCION_DIAS || '14', 10)
   },
+  // Extracción diaria simulada de la base de datos del sistema administrativo
+  // (tareas/extraccion.js): genera las operaciones del día anterior y las carga en el data lake.
+  extraccion: {
+    // Por defecto, todos los días a las 00:00 (medianoche).
+    horario: process.env.EXTRACCION_CRON || '0 0 * * *',
+    zona: process.env.RESPALDO_ZONA || undefined,
+    // Ventas aproximadas por día extraído (máximo 90 000 para que los id no se crucen entre días).
+    filas: Math.min(parseInt(process.env.EXTRACCION_FILAS || '150', 10) || 150, 90000)
+  },
   metricas: {
     // Recálculo de las tablas de métricas; por defecto, todos los días a las 02:30 (después del respaldo).
     horario: process.env.METRICAS_CRON || '30 2 * * *',

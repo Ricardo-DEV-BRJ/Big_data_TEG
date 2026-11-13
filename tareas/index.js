@@ -1,6 +1,7 @@
 /**
  * Tareas programadas (node-cron). Se inician una sola vez al arrancar el
  * servidor (bin/www) y se repiten mientras el proceso siga encendido.
+ *   extraccion-diaria extrae (simulado) las operaciones del día anterior al data lake (EXTRACCION_CRON)
  *   respaldo-diario   copia tablas de MariaDB al data lake (RESPALDO_CRON)
  *   metricas-diarias  recalcula las tablas de métricas del front (METRICAS_CRON)
  *   metricas-15min    recalcula solo si hay reportes nuevos desde el último cálculo
@@ -9,6 +10,7 @@
 const cron = require('node-cron');
 const config = require('../config');
 const respaldo = require('./respaldo');
+const extraccion = require('./extraccion');
 const calculoMetricas = require('../models/calculoMetricasModel');
 const db = require('../config/mariadb');
 
@@ -18,6 +20,14 @@ async function ejecutarRespaldo() {
     await respaldo();
   } catch (err) {
     console.error('[respaldo] falló:', err);
+  }
+}
+
+async function ejecutarExtraccion() {
+  try {
+    await extraccion.extraer();
+  } catch (err) {
+    console.error('[extraccion] falló:', err.message);
   }
 }
 
@@ -57,6 +67,7 @@ function programar(nombre, variable, { horario, zona }, tareaFn) {
 
 function iniciar() {
   return [
+    programar('extraccion-diaria', 'EXTRACCION_CRON', config.extraccion, ejecutarExtraccion),
     programar('respaldo-diario', 'RESPALDO_CRON', config.respaldo, ejecutarRespaldo),
     programar('metricas-diarias', 'METRICAS_CRON', config.metricas, ejecutarMetricas),
     programar('metricas-15min', 'METRICAS_INCREMENTAL_CRON',

@@ -109,20 +109,27 @@ npm run dev                          # http://localhost:8080
 
 ```bash
 cd Big_data_TEG
-npm run csv                                   # ~3 s: tmp/datos con ventas, inventario, compras, metas y tasas
+npm run csv          # ~5 s: genera los cinco reportes y los carga como Parquet en ventas, inventario, compras, metas y tasas
+```
+
+El generador no escribe nada en disco: cada reporte va en streaming a `staging/` de MinIO, se convierte
+a Parquet con el mismo proceso que `POST /api/ingestas` y queda registrado en `ingestas` (origen
+`generador`). Las métricas se recalculan solas en la revisión de 15 minutos (con la API encendida), o
+de inmediato con:
+
+```bash
 TOKEN=$(curl -s -H 'Content-Type: application/json' \
   -d '{"email":"admin@bigagrojm.com","password":"<su contraseña>"}' \
   http://localhost:3000/api/auth/login | node -pe 'JSON.parse(require("fs").readFileSync(0)).token')
-for d in ventas inventario compras metas tasas; do
-  curl -H "Authorization: Bearer $TOKEN" -F dataset=$d -F archivos=@tmp/datos/$d.csv http://localhost:3000/api/ingestas
-done
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/metricas/recalcular   # ~10 s
 ```
 
 Luego abrir http://localhost:8080 (entra al Tablero ejecutivo).
 
-Si el data lake tiene datos de otra prueba, vaciarlo antes (MinIO: borrar `parquet/<dataset>/`;
-MariaDB: `vaciarBase.sql`), porque el recálculo lee todos los Parquet de cada dataset.
+Cada ejecución de `npm run csv` **agrega** archivos al data lake: ejecutarlo dos veces con la misma semilla
+deja todas las ventas con el id repetido. Si el data lake tiene datos de otra prueba, vaciarlo antes
+(MinIO: borrar `parquet/<dataset>/`; MariaDB: `vaciarBase.sql`), porque el recálculo lee todos los
+Parquet de cada dataset.
 
 ---
 
@@ -140,6 +147,8 @@ MariaDB: `vaciarBase.sql`), porque el recálculo lee todos los Parquet de cada d
 | `RESPALDO_ZONA` | hora del servidor | Zona horaria IANA de las tareas (p. ej. `America/Caracas`) |
 | `RESPALDO_DIR` | `./respaldos` | Segunda copia del respaldo (disco externo, NAS o carpeta sincronizada con la nube) |
 | `RESPALDO_RETENCION_DIAS` | `14` | Días de respaldos locales que se conservan |
+| `EXTRACCION_CRON` | `0 0 * * *` | Hora de la extracción diaria simulada (medianoche) |
+| `EXTRACCION_FILAS` | `150` | Ventas aproximadas por día extraído (máximo 90 000) |
 | `METRICAS_CRON` | `30 2 * * *` | Hora del recálculo diario de métricas |
 | `METRICAS_INCREMENTAL_CRON` | `*/15 * * * *` | Revisión frecuente: recalcula solo si hay reportes nuevos |
 | `DATASET_VENTAS`, `DATASET_INVENTARIO`, `DATASET_COMPRAS`, `DATASET_METAS`, `DATASET_TASAS` | `ventas`, `inventario`, `compras`, `metas`, `tasas` | Carpetas del bucket de donde salen las métricas |
@@ -195,11 +204,12 @@ models/productosModel.js        Consultas DuckDB de ejemplo sobre productos y ve
 models/ejemploModel.js          Plantilla para escribir nuevas consultas DuckDB
 config/                         index (variables .env), roles (Tabla 18), minio, duckdb, mariadb, jwt
 middlewares/                    auth (token y roles), subidaCsv (multer → MinIO), errores (404 / 500)
-tareas/                         index (programación), respaldo (3-2-1)
+tareas/                         index (programación), extraccion (extracción diaria simulada), respaldo (3-2-1)
 utils/                          validaciones, http (código de error)
 tablas.sql                      Esquema de las tablas de métricas
 data_list/                      Catálogo de productos, clientes y datos del negocio para el generador
-scripts/                        generar-ventas (reportes del negocio), restaurar-respaldo, usuarios.sql,
+scripts/                        generar-ventas (reportes del negocio → data lake), generar-duplicados
+                                (prueba de reglas de duplicados), restaurar-respaldo, usuarios.sql,
                                 generar-csv-prueba (volumen)
 ```
 
@@ -286,12 +296,16 @@ Reglas del reporte de ventas:
 ### Generador de datos de prueba
 
 ```bash
-npm run csv -- [carpeta=tmp/datos] [ventas=60000] [desde=2025-10-01] [hasta=2026-09-30] [semilla=2026]
+npm run csv -- [ventas=60000] [desde=2025-10-01] [hasta=2026-09-30] [semilla=2026] [fecha_carga=hoy]
 ```
 
 `scripts/generar-ventas.js` simula la agrocomercializadora (una sede en Trujillo, tres vendedores) día
-por día y escribe los cinco CSV. Con la misma
-semilla genera siempre los mismos datos. Para que las métricas cuenten una historia:
+por día y carga los cinco reportes como Parquet en `parquet/<dataset>/fecha_carga=<fecha_carga>/`
+(los nombres de dataset salen de `DATASET_VENTAS`, `DATASET_INVENTARIO`, etc.). Necesita MinIO y
+MariaDB encendidos; no guarda nada en local. Con la misma semilla genera siempre los mismos datos; el
+catálogo (clientes y pesos de los productos) usa siempre la semilla fija 2026 y el período base
+2025-10-01 a 2026-09-30, que también sirve de referencia a la tasa y la tendencia de precios.
+Para que las métricas cuenten una historia:
 
 - **Pareto**: pocos productos y clientes concentran la mayoría de las ventas.
 - **Estacionalidad agrícola**: cada categoría sigue el calendario andino (semillas en siembra de
@@ -319,6 +333,32 @@ agroquímicos, alimento animal, veterinarios, herramientas y riego, rubros perec
 (clientes) y `negocio.js` (sede, vendedores, métodos de pago, crédito, proveedores y estacionalidad).
 
 `npm run csv-prueba -- ruta.csv 2000000` genera un CSV simple solo para pruebas de volumen.
+
+### Prueba de duplicados
+
+```bash
+npm run csv-duplicados -- [ventas_id=50] [ventas_posibles=30] [ventas_fuera_ventana=20] [inventario=40] [compras=20] [--verificar]
+npm run csv-duplicados -- --limpiar
+```
+
+`scripts/generar-duplicados.js` toma filas reales del data lake (ejecutar antes `npm run csv`) y escribe
+copias en archivos `duplicados_*.parquet` de la partición de hoy, registrados en `ingestas` con origen
+`duplicados`:
+
+| Archivo | Qué contiene | Regla que lo debe detectar |
+|---|---|---|
+| `duplicados_ventas_id` | Ventas con el mismo id (reporte subido dos veces) | `ventas.id_duplicado` (se excluyen de las métricas) |
+| `duplicados_ventas_posibles` | Otro id, mismo cliente, producto, cantidad y total, 1–8 min después | `ventas.posible_duplicado` y `/duplicados` |
+| `duplicados_ventas_fuera_ventana` | Igual, pero 20–59 min después | Ninguna: control de falsos positivos |
+| `duplicados_inventario` | Mismo día, sucursal y producto | `inventario.fila_duplicada` |
+| `duplicados_compras` | Mismo número de orden | `compras.orden_duplicada` |
+
+Con `--verificar` recalcula las métricas antes y después, compara el incremento de cada regla en
+`calidad_datos` con lo inyectado y revisa que los posibles duplicados aparezcan en
+`ventas_posibles_duplicados` (y los de fuera de ventana no); sale con código 1 si algo no cuadra.
+Los duplicados de inventario, compras y los posibles duplicados de ventas sí alteran las métricas (como
+pasaría con datos reales): `--limpiar` borra todos los archivos inyectados y sus registros en `ingestas`;
+después hay que recalcular.
 
 ---
 
@@ -551,9 +591,24 @@ se registra en consola sin tumbar el servidor; si una ejecución no ha terminado
 
 | Tarea | Horario | Qué hace |
 |---|---|---|
+| `extraccion-diaria` | `EXTRACCION_CRON` (00:00) | Simula la extracción de la base de datos del sistema administrativo: genera el día anterior (ver abajo) |
 | `respaldo-diario` | `RESPALDO_CRON` (02:00) | Respaldo 3-2-1 de **todas** las tablas de MariaDB (ver abajo) |
 | `metricas-diarias` | `METRICAS_CRON` (02:30) | Recalcula todas las tablas de métricas |
 | `metricas-15min` | `METRICAS_INCREMENTAL_CRON` (cada 15 min) | Si hay ingestas posteriores al último recálculo exitoso (p. ej. existencias del día), recalcula; si no, no hace nada |
+
+**Extracción diaria** (`tareas/extraccion.js`): a medianoche genera con `scripts/generar-ventas.js` las
+operaciones del día que terminó (~`EXTRACCION_FILAS` ventas, el inventario de cada producto, las compras,
+las metas del día y la tasa) y las carga como Parquet en `parquet/<dataset>/fecha_carga=<día extraído>/`,
+registradas en `ingestas` con origen `extraccion`. La revisión de 15 minutos las incluye en las métricas.
+
+- Semilla = `AAAAMMDD` del día. Los id de venta son `AAAAMMDD × 100 000 + n` y las órdenes de compra
+  `OC-AAAAMMDD-n`, así no chocan con la carga inicial ni con otros días.
+- El catálogo (clientes, fechas de alta, productos estrella) es el mismo de la carga inicial, y la tasa,
+  los precios y los costos siguen su tendencia según la fecha.
+- Si el día ya fue extraído, no hace nada (volver a cargarlo repetiría los mismos id).
+- Las ventas a crédito del día quedan como `Pendiente` o `Parcial`: la extracción no actualiza pagos
+  de días anteriores.
+- Manual: `npm run extraccion -- [AAAA-MM-DD=ayer]` (no hace falta tener la API encendida).
 
 **Respaldo 3-2-1** (`tareas/respaldo.js`):
 
@@ -658,8 +713,8 @@ cada sentencia abre su propia conexión sobre una única instancia en memoria.
 
 ## 14. Entrega del proyecto
 
-No incluir en el paquete: `.env` (credenciales), `node_modules/`, `dist/`, `tmp/` (CSV generados) ni
-`respaldos/`; ya están en `.gitignore`. Los datos se regeneran con `npm run csv`. Con git:
+No incluir en el paquete: `.env` (credenciales), `node_modules/`, `dist/`, `tmp/` ni `respaldos/`; ya
+están en `.gitignore`. Los datos se regeneran en el data lake con `npm run csv`. Con git:
 
 ```bash
 git archive --format=zip -o ../AgroData_JM_backend.zip HEAD      # solo archivos versionados

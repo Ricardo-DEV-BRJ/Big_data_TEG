@@ -77,8 +77,9 @@ function copiarAParquet(origen, destino, archivoOrigen, separador, muestra) {
  * y borra el CSV de staging/ (también si la conversión falla).
  * @param {{clave: string, size: number}} csv  objeto subido por el middleware subidaCsv
  * @param {{dataset: string, fecha: string, archivoOrigen: string}} datos  ya validados
+ * @param {string} [cargadoPor='api']  valor de ingestas.origen: 'api', 'generador' o 'duplicados' (scripts de prueba)
  */
-async function crear(csv, { dataset, fecha, archivoOrigen }) {
+async function crear(csv, { dataset, fecha, archivoOrigen }, cargadoPor = 'api') {
   const clave = datalake.prefijoParticion(dataset, fecha) + datalake.nombreParquet(archivoOrigen);
   const origen = datalake.urlS3(csv.clave);
   const destino = datalake.urlS3(clave);
@@ -109,7 +110,7 @@ async function crear(csv, { dataset, fecha, archivoOrigen }) {
         csv.size,
         await datalake.tamanoObjeto(clave),
         ((Date.now() - inicio) / 1000).toFixed(2),
-        'api'
+        cargadoPor
       ]
     );
     return obtener(r.insertId);
